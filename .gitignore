@@ -1,5 +1,9 @@
 .paperbot_streamlit_settings.json
 .paperbot_history.json
+.env
+.env.*
+!.env.example
+.venv/
 .claude/
 __pycache__/
 *.py[cod]
@@ -15,6 +19,7 @@ dist/
 downloads/
 eggs/
 .eggs/
+.pytest_cache/
 lib/
 lib64/
 parts/
@@ -24,3 +29,4 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.codex/
