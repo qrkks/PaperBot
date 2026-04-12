@@ -25,6 +25,30 @@ ZOTERO_BASE = "https://api.zotero.org"
 ZOTERO_PAGE_SIZE = 100
 OPENALEX_BASE = "https://api.openalex.org"
 
+
+def load_local_dotenv(env_path: str = ".env") -> None:
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                os.environ[key] = value
+    except OSError:
+        return
+
+
+load_local_dotenv()
+
 PUBMED_SORT_VALUES = ["relevance", "pub_date", "Author", "JournalName"]
 SECONDARY_SORT_VALUES = [
     "none",

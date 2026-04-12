@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -34,6 +35,7 @@ from pubmed_to_zotero import (
 
 SETTINGS_FILE = Path(__file__).with_name(".paperbot_streamlit_settings.json")
 HISTORY_FILE = Path(__file__).with_name(".paperbot_history.json")
+ENV_FILE = Path(__file__).with_name(".env")
 SETTINGS_KEYS = [
     "zotero_user_id",
     "zotero_api_key",
@@ -73,6 +75,30 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "remember_settings": True,
 }
 MAX_HISTORY_ENTRIES = 50
+
+
+
+def load_local_dotenv(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+            os.environ[key] = value
+    except OSError:
+        return
+
+
+load_local_dotenv(ENV_FILE)
 
 
 def load_history() -> list[dict[str, Any]]:
@@ -173,7 +199,70 @@ def load_settings() -> dict[str, Any]:
         return {}
     if not isinstance(raw, dict):
         return {}
-    return {k: raw.get(k, DEFAULT_SETTINGS[k]) for k in SETTINGS_KEYS}
+    return {k: raw[k] for k in SETTINGS_KEYS if k in raw}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def load_env_settings() -> dict[str, Any]:
+    library_type = os.getenv("ZOTERO_LIBRARY_TYPE", DEFAULT_SETTINGS["library_type"])
+    if library_type not in {"users", "groups"}:
+        library_type = DEFAULT_SETTINGS["library_type"]
+
+    pubmed_sort = os.getenv("PUBMED_SORT", DEFAULT_SETTINGS["pubmed_sort"])
+    if pubmed_sort not in PUBMED_SORT_VALUES:
+        pubmed_sort = DEFAULT_SETTINGS["pubmed_sort"]
+
+    secondary_sort = os.getenv("SECONDARY_SORT", DEFAULT_SETTINGS["secondary_sort"])
+    if secondary_sort not in SECONDARY_SORT_VALUES:
+        secondary_sort = DEFAULT_SETTINGS["secondary_sort"]
+
+    duplicate_scope = os.getenv("DUPLICATE_SCOPE", DEFAULT_SETTINGS["duplicate_scope"])
+    if duplicate_scope not in {"library", "collection"}:
+        duplicate_scope = DEFAULT_SETTINGS["duplicate_scope"]
+
+    manual_collection_path = normalize_collection_path(
+        os.getenv("ZOTERO_COLLECTION_PATH", DEFAULT_SETTINGS["manual_collection_path"])
+    )
+
+    return {
+        "zotero_user_id": os.getenv("ZOTERO_USER_ID", DEFAULT_SETTINGS["zotero_user_id"]),
+        "zotero_api_key": os.getenv("ZOTERO_API_KEY", DEFAULT_SETTINGS["zotero_api_key"]),
+        "library_type": library_type,
+        "library_id_input": os.getenv("ZOTERO_LIBRARY_ID", DEFAULT_SETTINGS["library_id_input"]),
+        "pubmed_sort": pubmed_sort,
+        "secondary_sort": secondary_sort,
+        "attach_metrics_to_extra": _env_flag(
+            "ATTACH_METRICS_TO_EXTRA",
+            DEFAULT_SETTINGS["attach_metrics_to_extra"],
+        ),
+        "skip_duplicates": _env_flag("SKIP_DUPLICATES", DEFAULT_SETTINGS["skip_duplicates"]),
+        "duplicate_scope": duplicate_scope,
+        "openalex_email": os.getenv("OPENALEX_EMAIL", DEFAULT_SETTINGS["openalex_email"]),
+        "openalex_api_key": os.getenv("OPENALEX_API_KEY", DEFAULT_SETTINGS["openalex_api_key"]),
+        "ncbi_email": os.getenv("NCBI_EMAIL", DEFAULT_SETTINGS["ncbi_email"]),
+        "ncbi_api_key": os.getenv("NCBI_API_KEY", DEFAULT_SETTINGS["ncbi_api_key"]),
+        "manual_collection_path": manual_collection_path,
+        "selected_collection_path": manual_collection_path,
+        "auto_create_collection": _env_flag(
+            "ZOTERO_AUTO_CREATE_COLLECTION",
+            DEFAULT_SETTINGS["auto_create_collection"],
+        ),
+        "remember_settings": _env_flag(
+            "PAPERBOT_REMEMBER_SETTINGS",
+            DEFAULT_SETTINGS["remember_settings"],
+        ),
+    }
 
 
 def save_settings(values: dict[str, Any]) -> None:
@@ -196,9 +285,13 @@ def current_settings() -> dict[str, Any]:
 def bootstrap_settings() -> None:
     if st.session_state.get("settings_initialized"):
         return
-    loaded = load_settings()
+    env_loaded = load_env_settings()
+    file_loaded = load_settings()
     for key in SETTINGS_KEYS:
-        st.session_state[key] = loaded.get(key, DEFAULT_SETTINGS[key])
+        st.session_state[key] = file_loaded.get(
+            key,
+            env_loaded.get(key, DEFAULT_SETTINGS[key]),
+        )
     st.session_state["settings_initialized"] = True
 
 

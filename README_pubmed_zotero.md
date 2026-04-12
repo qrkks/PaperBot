@@ -31,6 +31,8 @@ $env:ZOTERO_USER_ID="your_user_id"
 $env:ZOTERO_API_KEY="your_api_key"
 ```
 
+Or create a local `.env` file from `.env.example`. The CLI and Streamlit app now load `.env` automatically.
+
 Optional for NCBI:
 
 ```powershell
@@ -154,3 +156,4 @@ In the UI:
 - When an item already exists in the library but not in the target collection, the app links the existing item into the target collection instead of creating a duplicate.
 - Streamlit saved settings file: `.paperbot_streamlit_settings.json` (project root).
 - Streamlit history file: `.paperbot_history.json` (project root).
+- Streamlit config priority is: `.paperbot_streamlit_settings.json` > environment variables / `.env` > defaults.
