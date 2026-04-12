@@ -6,6 +6,7 @@ It includes:
 
 - a CLI importer: `pubmed_to_zotero.py`
 - a Streamlit web app: `app_streamlit.py`
+- an internal package: `paperbot/`
 
 ## Features
 
@@ -142,10 +143,29 @@ If a local `.env` exists, the app now reads it automatically at startup.
 
 ## Project Files
 
-- `pubmed_to_zotero.py`: CLI and core import logic
-- `app_streamlit.py`: Streamlit UI
+- `paperbot/core.py`: core PubMed/Zotero logic
+- `paperbot/web.py`: Streamlit app implementation
+- `paperbot/cli.py`: CLI entry module
+- `paperbot/__main__.py`: package entrypoint
+- `pubmed_to_zotero.py`: backward-compatible CLI wrapper
+- `app_streamlit.py`: backward-compatible Streamlit wrapper
 - `test_pubmed_to_zotero.py`: unit tests
 - `requirements.txt`: dependencies
+
+## Entry Points
+
+Backward-compatible commands still work:
+
+```powershell
+python .\pubmed_to_zotero.py --query "glioblastoma AND immunotherapy" --dry-run
+streamlit run .\app_streamlit.py
+```
+
+You can also use the package entrypoint:
+
+```powershell
+python -m paperbot --query "glioblastoma AND immunotherapy" --dry-run
+```
 
 Local-only files are intentionally ignored:
 

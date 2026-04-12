@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import MagicMock, call, patch
 
-import pubmed_to_zotero as pz
+import paperbot.core as pz
 
 
 class CollectionTests(unittest.TestCase):
@@ -43,8 +43,8 @@ class CollectionTests(unittest.TestCase):
         self.assertNotIn("test", mapping)
         self.assertEqual(mapping["unique"], "B")
 
-    @patch("pubmed_to_zotero.create_collection")
-    @patch("pubmed_to_zotero.list_collections")
+    @patch("paperbot.core.create_collection")
+    @patch("paperbot.core.list_collections")
     def test_ensure_collection_path_existing_only(self, mock_list: MagicMock, mock_create: MagicMock) -> None:
         mock_list.return_value = [
             {"key": "A", "data": {"name": "ProjectA", "parentCollection": ""}},
@@ -62,8 +62,8 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(key, "B")
         mock_create.assert_not_called()
 
-    @patch("pubmed_to_zotero.create_collection")
-    @patch("pubmed_to_zotero.list_collections")
+    @patch("paperbot.core.create_collection")
+    @patch("paperbot.core.list_collections")
     def test_ensure_collection_path_existing_root_collection_with_false_parent(
         self,
         mock_list: MagicMock,
@@ -83,8 +83,8 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(key, "ROOT1")
         mock_create.assert_not_called()
 
-    @patch("pubmed_to_zotero.create_collection")
-    @patch("pubmed_to_zotero.list_collections")
+    @patch("paperbot.core.create_collection")
+    @patch("paperbot.core.list_collections")
     def test_ensure_collection_path_partial_create(self, mock_list: MagicMock, mock_create: MagicMock) -> None:
         mock_list.return_value = [
             {"key": "A", "data": {"name": "ProjectA", "parentCollection": ""}},
@@ -120,7 +120,7 @@ class CollectionTests(unittest.TestCase):
             ],
         )
 
-    @patch("pubmed_to_zotero.list_collections")
+    @patch("paperbot.core.list_collections")
     def test_ensure_collection_path_missing_without_auto_create_raises(self, mock_list: MagicMock) -> None:
         mock_list.return_value = [
             {"key": "A", "data": {"name": "ProjectA", "parentCollection": ""}},
@@ -135,7 +135,7 @@ class CollectionTests(unittest.TestCase):
                 auto_create=False,
             )
 
-    @patch("pubmed_to_zotero.list_collections")
+    @patch("paperbot.core.list_collections")
     def test_ensure_collection_path_ambiguous_raises(self, mock_list: MagicMock) -> None:
         mock_list.return_value = [
             {"key": "A1", "data": {"name": "test", "parentCollection": False}},
@@ -155,7 +155,7 @@ class CollectionTests(unittest.TestCase):
 
 
 class ItemPayloadTests(unittest.TestCase):
-    @patch("pubmed_to_zotero.requests.post")
+    @patch("paperbot.core.requests.post")
     def test_zotero_create_items_attaches_collection_key(self, mock_post: MagicMock) -> None:
         response = MagicMock()
         response.text = '{"successful":{}}'
@@ -340,7 +340,7 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(skipped_incoming, 0)
         self.assertEqual(linked, 0)
 
-    @patch("pubmed_to_zotero.requests.get")
+    @patch("paperbot.core.requests.get")
     def test_list_existing_identifiers(self, mock_get: MagicMock) -> None:
         response1 = MagicMock()
         response1.json.return_value = [
@@ -361,7 +361,7 @@ class MetricTests(unittest.TestCase):
         self.assertIn("123", pmids)
         self.assertIn("456", pmids)
 
-    @patch("pubmed_to_zotero.requests.post")
+    @patch("paperbot.core.requests.post")
     def test_zotero_link_existing_items_to_collection(self, mock_post: MagicMock) -> None:
         response = MagicMock()
         response.text = '{"successful":{"0":{"key":"ITEM1"}}}'
@@ -387,7 +387,7 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(payload[0]["version"], 9)
         self.assertIn("TARGET", payload[0]["collections"])
 
-    @patch("pubmed_to_zotero._request")
+    @patch("paperbot.core._request")
     def test_search_pubmed_ids_passes_sort(self, mock_request: MagicMock) -> None:
         response = MagicMock()
         response.json.return_value = {"esearchresult": {"idlist": ["1"]}}
@@ -404,7 +404,7 @@ class MetricTests(unittest.TestCase):
         params = mock_request.call_args.args[1]
         self.assertEqual(params["sort"], "pub_date")
 
-    @patch("pubmed_to_zotero.requests.get")
+    @patch("paperbot.core.requests.get")
     def test_fetch_openalex_metrics_uses_valid_select_fields(self, mock_get: MagicMock) -> None:
         response = MagicMock()
         response.status_code = 200
