@@ -32,7 +32,11 @@ from paperbot.core import (
     zotero_create_items,
     zotero_link_existing_items_to_collection,
 )
-from paperbot.ui_state import coerce_history_entry_id, format_history_entry_label
+from paperbot.ui_state import (
+    coerce_history_entry_id,
+    first_present_value,
+    format_history_entry_label,
+)
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -914,15 +918,23 @@ def render_selectable_records_editor(
                 "PMID": record.get("PMID") or record.get("pmid", ""),
                 "DOI": record.get("DOI") or record.get("doi", ""),
                 "Cited By": _display_int(
-                    record.get("_metric_citation_count") or record.get("cited_by")
+                    first_present_value(
+                        record.get("_metric_citation_count"),
+                        record.get("cited_by"),
+                    )
                 ),
                 "Journal Metric": _display_float(
-                    record.get("_metric_journal_2yr_mean_citedness")
-                    or record.get("journal_metric"),
+                    first_present_value(
+                        record.get("_metric_journal_2yr_mean_citedness"),
+                        record.get("journal_metric"),
+                    ),
                     digits=4,
                 ),
                 "Hybrid Score": _display_float(
-                    record.get("_metric_hybrid_score") or record.get("hybrid_score"),
+                    first_present_value(
+                        record.get("_metric_hybrid_score"),
+                        record.get("hybrid_score"),
+                    ),
                     digits=2,
                 ),
             }

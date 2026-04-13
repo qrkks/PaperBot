@@ -3,6 +3,16 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 
+def first_present_value(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and value == "":
+            continue
+        return value
+    return None
+
+
 def coerce_selectbox_value(
     selected_value: str | None,
     options: Sequence[str],

@@ -3,6 +3,7 @@ import unittest
 from paperbot.ui_state import (
     coerce_history_entry_id,
     coerce_selectbox_value,
+    first_present_value,
     format_history_entry_label,
 )
 
@@ -38,6 +39,14 @@ class UIStateTests(unittest.TestCase):
             format_history_entry_label(entry),
             "2026-04-13 10:00:00 | preview | financial toxicity",
         )
+
+    def test_first_present_value_preserves_zero(self) -> None:
+        self.assertEqual(first_present_value(0, 12), 0)
+        self.assertEqual(first_present_value(0.0, 2.5), 0.0)
+
+    def test_first_present_value_skips_none_and_empty_string(self) -> None:
+        self.assertEqual(first_present_value(None, "", "x"), "x")
+        self.assertIsNone(first_present_value(None, ""))
 
 
 if __name__ == "__main__":
