@@ -1050,6 +1050,45 @@ def fetch_openalex_metrics_by_pmids(
     return metrics
 
 
+def backfill_journal_metrics_from_record_issns(
+    records: list[dict[str, Any]],
+    metrics_by_pmid: dict[str, dict[str, Any]],
+    email: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    pmid_to_issn: dict[str, str] = {}
+    for record in records:
+        pmid = _normalize_pmid_value(record.get("PMID"))
+        if not pmid:
+            continue
+        existing_metric = _safe_float(
+            metrics_by_pmid.get(pmid, {}).get("journal_metric_2yr_mean_citedness")
+        )
+        if existing_metric is not None:
+            continue
+        issn = str(record.get("ISSN", "") or "").strip()
+        if issn:
+            pmid_to_issn[pmid] = issn
+
+    if not pmid_to_issn:
+        return metrics_by_pmid
+
+    source_metric_map = fetch_openalex_source_metrics_by_issn(
+        issns=list(pmid_to_issn.values()),
+        email=email,
+        api_key=api_key,
+    )
+    for pmid, issn in pmid_to_issn.items():
+        metric = source_metric_map.get(issn)
+        if metric is None:
+            continue
+        metrics_by_pmid.setdefault(pmid, {})[
+            "journal_metric_2yr_mean_citedness"
+        ] = metric
+
+    return metrics_by_pmid
+
+
 def _compute_hybrid_score(
     citation_count: int | None, journal_metric: float | None
 ) -> float | None:

@@ -200,6 +200,30 @@ class MetricTests(unittest.TestCase):
         self.assertIn("Secondary Sort: citation_count_desc", extra)
         self.assertIn("Metrics Snapshot Date: 2026-04-11", extra)
 
+    @patch("paperbot.core.fetch_openalex_source_metrics_by_issn")
+    def test_backfill_journal_metrics_from_record_issns(
+        self, mock_fetch: MagicMock
+    ) -> None:
+        mock_fetch.return_value = {"1234-5678": 2.75}
+        records = [
+            {"PMID": "123", "ISSN": "1234-5678"},
+            {"PMID": "456", "ISSN": "9999-9999"},
+        ]
+        metrics = {
+            "123": {"citation_count": 10, "journal_metric_2yr_mean_citedness": None},
+            "456": {"citation_count": 5, "journal_metric_2yr_mean_citedness": 1.5},
+        }
+
+        updated = pz.backfill_journal_metrics_from_record_issns(records, metrics)
+
+        self.assertEqual(updated["123"]["journal_metric_2yr_mean_citedness"], 2.75)
+        self.assertEqual(updated["456"]["journal_metric_2yr_mean_citedness"], 1.5)
+        mock_fetch.assert_called_once_with(
+            issns=["1234-5678"],
+            email=None,
+            api_key=None,
+        )
+
     def test_secondary_sort_records_by_citation(self) -> None:
         records = [
             {"PMID": "1", "_metric_citation_count": 10},
