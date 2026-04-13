@@ -43,6 +43,18 @@ class CollectionTests(unittest.TestCase):
         self.assertNotIn("test", mapping)
         self.assertEqual(mapping["unique"], "B")
 
+    def test_collect_collection_tree_keys_includes_descendants(self) -> None:
+        collections = [
+            {"key": "ROOT", "data": {"name": "Root", "parentCollection": False}},
+            {"key": "A", "data": {"name": "A", "parentCollection": "ROOT"}},
+            {"key": "B", "data": {"name": "B", "parentCollection": "ROOT"}},
+            {"key": "A1", "data": {"name": "A1", "parentCollection": "A"}},
+        ]
+
+        keys = pz.collect_collection_tree_keys(collections, "ROOT")
+
+        self.assertEqual(keys, ["ROOT", "A", "B", "A1"])
+
     @patch("paperbot.core.create_collection")
     @patch("paperbot.core.list_collections")
     def test_ensure_collection_path_existing_only(self, mock_list: MagicMock, mock_create: MagicMock) -> None:
@@ -190,6 +202,7 @@ class ItemPayloadTests(unittest.TestCase):
                     "key": "ITEM1",
                     "version": 7,
                     "extra": "OpenAlex Cited By: 10",
+                    "tags": [{"tag": "paperbot:metrics", "type": 0}],
                     "_metric_citation_count": 10,
                 }
             ],
@@ -198,8 +211,46 @@ class ItemPayloadTests(unittest.TestCase):
         payload = mock_post.call_args.kwargs["json"]
         self.assertEqual(
             payload,
-            [{"key": "ITEM1", "version": 7, "extra": "OpenAlex Cited By: 10"}],
+            [
+                {
+                    "key": "ITEM1",
+                    "version": 7,
+                    "extra": "OpenAlex Cited By: 10",
+                    "tags": [{"tag": "paperbot:metrics", "type": 0}],
+                }
+            ],
         )
+
+    @patch("paperbot.core.requests.post")
+    def test_zotero_update_items_batches_and_reindexes_results(
+        self, mock_post: MagicMock
+    ) -> None:
+        first = MagicMock()
+        first.text = '{"successful":{"0":{"key":"ITEM1"},"1":{"key":"ITEM2"}}}'
+        first.json.return_value = {
+            "successful": {"0": {"key": "ITEM1"}, "1": {"key": "ITEM2"}}
+        }
+        second = MagicMock()
+        second.text = '{"successful":{"0":{"key":"ITEM3"}}}'
+        second.json.return_value = {"successful": {"0": {"key": "ITEM3"}}}
+        mock_post.side_effect = [first, second]
+
+        result = pz.zotero_update_items(
+            library_type="users",
+            library_id="123",
+            api_key="k",
+            items=[
+                {"key": "ITEM1", "version": 1, "extra": "a"},
+                {"key": "ITEM2", "version": 2, "extra": "b"},
+                {"key": "ITEM3", "version": 3, "extra": "c"},
+            ],
+            batch_size=2,
+        )
+
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(result["successful"]["0"]["key"], "ITEM1")
+        self.assertEqual(result["successful"]["1"]["key"], "ITEM2")
+        self.assertEqual(result["successful"]["2"]["key"], "ITEM3")
 
 
 class MetricTests(unittest.TestCase):
@@ -222,6 +273,7 @@ class MetricTests(unittest.TestCase):
                     "DOI": "10.1000/abc",
                     "extra": "PMID: 123",
                     "ISSN": "1234-5678",
+                    "tags": [{"tag": "existing", "type": 0}],
                 },
             }
         ]
@@ -237,6 +289,7 @@ class MetricTests(unittest.TestCase):
 
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["PMID"], "123")
+        self.assertEqual(items[0]["tags"], [{"tag": "existing", "type": 0}])
         self.assertIn("/collections/COLL1/items", mock_get.call_args.args[0])
         self.assertEqual(mock_get.call_args.kwargs["params"]["limit"], 1)
 
@@ -263,6 +316,17 @@ class MetricTests(unittest.TestCase):
         self.assertIn("OpenAlex Journal 2yr Mean Citedness: 3.5000", extra)
         self.assertIn("Secondary Sort: citation_count_desc", extra)
         self.assertIn("Metrics Snapshot Date: 2026-04-11", extra)
+        tags = records[0]["tags"]
+        self.assertIn({"tag": "paperbot:metrics", "type": 0}, tags)
+        self.assertIn({"tag": "paperbot:cited-by:1+", "type": 0}, tags)
+        self.assertIn({"tag": "paperbot:cited-by:5+", "type": 0}, tags)
+        self.assertIn({"tag": "paperbot:cited-by:10+", "type": 0}, tags)
+        self.assertIn({"tag": "paperbot:cited-by:20+", "type": 0}, tags)
+        self.assertIn({"tag": "paperbot:journal-metric:3+", "type": 0}, tags)
+        self.assertIn({"tag": "paperbot:journal-metric:1+", "type": 0}, tags)
+        self.assertIn({"tag": "paperbot:journal-metric:2+", "type": 0}, tags)
+        self.assertIn({"tag": "paperbot:hybrid-score:1+", "type": 0}, tags)
+        self.assertIn({"tag": "paperbot:hybrid-score:2+", "type": 0}, tags)
 
     @patch("paperbot.core.fetch_openalex_source_metrics_by_issn")
     def test_backfill_journal_metrics_from_record_issns(

@@ -300,6 +300,32 @@ def find_ambiguous_collection_paths(collections: list[dict[str, Any]]) -> dict[s
     }
 
 
+def collect_collection_tree_keys(
+    collections: list[dict[str, Any]],
+    root_key: str,
+    include_root: bool = True,
+) -> list[str]:
+    normalized_root = str(root_key or "").strip()
+    if not normalized_root:
+        return []
+
+    children_by_parent: dict[str | None, list[str]] = {}
+    for collection in collections:
+        key = str(collection.get("key", "")).strip()
+        if not key:
+            continue
+        parent = _normalize_parent_collection((collection.get("data", {}) or {}).get("parentCollection"))
+        children_by_parent.setdefault(parent, []).append(key)
+
+    ordered_keys: list[str] = [normalized_root] if include_root else []
+    queue = list(children_by_parent.get(normalized_root, []))
+    while queue:
+        current = queue.pop(0)
+        ordered_keys.append(current)
+        queue.extend(children_by_parent.get(current, []))
+    return ordered_keys
+
+
 def create_collection(
     library_type: str,
     library_id: str,
@@ -765,6 +791,7 @@ def list_zotero_items(
                     or _extract_pmid_from_extra(data.get("extra")),
                     "ISSN": str(data.get("ISSN", "")).strip(),
                     "extra": str(data.get("extra", "") or ""),
+                    "tags": list(data.get("tags", []) or []),
                 }
             )
 
@@ -966,6 +993,7 @@ def zotero_update_items(
     library_id: str,
     api_key: str,
     items: list[dict[str, Any]],
+    batch_size: int = 25,
 ) -> dict[str, Any]:
     normalized_library_id = validate_library_id(library_type, library_id)
     url = f"{ZOTERO_BASE}/{library_type}/{normalized_library_id}/items"
@@ -984,6 +1012,7 @@ def zotero_update_items(
         "ISSN",
         "extra",
         "collections",
+        "tags",
     }
     for item in items:
         payload = {
@@ -997,16 +1026,30 @@ def zotero_update_items(
     if not payload_items:
         return {"successful": {}, "failed": {}}
 
-    response = requests.post(
-        url,
-        headers=_zotero_headers(api_key),
-        json=payload_items,
-        timeout=30,
-    )
-    response.raise_for_status()
-    if response.text:
-        return response.json()
-    return {"successful": {}, "failed": {}}
+    merged_successful: dict[str, Any] = {}
+    merged_failed: dict[str, Any] = {}
+    global_index = 0
+    batch_size = max(int(batch_size), 1)
+
+    for batch in chunked(payload_items, batch_size):
+        response = requests.post(
+            url,
+            headers=_zotero_headers(api_key),
+            json=batch,
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = response.json() if response.text else {"successful": {}, "failed": {}}
+
+        for local_index, value in (result.get("successful", {}) or {}).items():
+            if str(local_index).isdigit():
+                merged_successful[str(global_index + int(local_index))] = value
+        for local_index, value in (result.get("failed", {}) or {}).items():
+            if str(local_index).isdigit():
+                merged_failed[str(global_index + int(local_index))] = value
+        global_index += len(batch)
+
+    return {"successful": merged_successful, "failed": merged_failed}
 
 
 def filter_duplicate_records(
@@ -1222,6 +1265,103 @@ def _compute_hybrid_score(
     return 0.7 * cited_component + 0.3 * journal_component
 
 
+def _normalize_zotero_tag_entries(tags: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in tags:
+        if isinstance(entry, dict):
+            tag_text = str(entry.get("tag", "")).strip()
+            tag_type = entry.get("type", 0)
+        else:
+            tag_text = str(entry).strip()
+            tag_type = 0
+        if not tag_text or tag_text in seen:
+            continue
+        seen.add(tag_text)
+        normalized.append({"tag": tag_text, "type": tag_type})
+    return normalized
+
+
+def _metric_threshold_tags(
+    prefix: str,
+    value: float | int,
+    thresholds: list[float],
+) -> list[str]:
+    matched_thresholds = [threshold for threshold in thresholds if value >= threshold]
+    if not matched_thresholds:
+        return [f"{prefix}:0+"]
+
+    tags: list[str] = []
+    for threshold in matched_thresholds:
+        if float(threshold).is_integer():
+            tags.append(f"{prefix}:{int(threshold)}+")
+        else:
+            tags.append(f"{prefix}:{threshold:.1f}+")
+    return tags
+
+
+def _build_metric_tags(
+    citation_count: int | None,
+    journal_metric: float | None,
+    hybrid_score: float | None,
+) -> list[str]:
+    tags = ["paperbot:metrics"]
+    if citation_count is not None:
+        tags.extend(
+            _metric_threshold_tags(
+                "paperbot:cited-by",
+                citation_count,
+                [1, 5, 10, 20, 50, 100, 200, 500, 1000],
+            )
+        )
+    if journal_metric is not None:
+        tags.extend(
+            _metric_threshold_tags(
+                "paperbot:journal-metric",
+                journal_metric,
+                [1, 2, 3, 5, 10],
+            )
+        )
+    if hybrid_score is not None:
+        tags.extend(
+            _metric_threshold_tags(
+                "paperbot:hybrid-score",
+                hybrid_score,
+                [1, 2, 3, 4, 5],
+            )
+        )
+    return tags
+
+
+def _upsert_metric_tags(
+    existing_tags: list[Any],
+    citation_count: int | None,
+    journal_metric: float | None,
+    hybrid_score: float | None,
+) -> list[dict[str, Any]]:
+    normalized = _normalize_zotero_tag_entries(existing_tags)
+    managed_prefixes = (
+        "paperbot:metrics",
+        "paperbot:cited-by:",
+        "paperbot:journal-metric:",
+        "paperbot:hybrid-score:",
+    )
+    preserved = [
+        tag_entry
+        for tag_entry in normalized
+        if not str(tag_entry.get("tag", "")).startswith(managed_prefixes)
+    ]
+    metric_entries = [
+        {"tag": tag_text, "type": 0}
+        for tag_text in _build_metric_tags(
+            citation_count,
+            journal_metric,
+            hybrid_score,
+        )
+    ]
+    return _normalize_zotero_tag_entries(preserved + metric_entries)
+
+
 def _upsert_extra_metric_lines(
     existing_extra: str,
     citation_count: int | None,
@@ -1258,6 +1398,7 @@ def apply_secondary_metrics_to_records(
     metrics_by_pmid: dict[str, dict[str, Any]],
     secondary_sort: str,
     attach_to_extra: bool = True,
+    attach_to_tags: bool = True,
     snapshot_date: str | None = None,
 ) -> None:
     metric_date = snapshot_date or dt.date.today().isoformat()
@@ -1283,6 +1424,13 @@ def apply_secondary_metrics_to_records(
                 source_name=source_name,
                 secondary_sort=secondary_sort,
                 snapshot_date=metric_date,
+            )
+        if attach_to_tags:
+            record["tags"] = _upsert_metric_tags(
+                existing_tags=list(record.get("tags", []) or []),
+                citation_count=citation_count,
+                journal_metric=journal_metric,
+                hybrid_score=hybrid_score,
             )
 
 

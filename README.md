@@ -15,6 +15,7 @@ It includes:
 - Select or auto-create Zotero collection paths
 - Separate PubMed sorting from local secondary reranking
 - Optional OpenAlex-based citation and journal metrics
+- Write metric snapshots into Zotero `extra` and filter-friendly tags
 - Enrich existing Zotero items with citation/journal metrics in `extra`
 - Preview before import
 - Re-check duplicate status against the current Zotero state

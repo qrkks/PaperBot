@@ -16,6 +16,7 @@ from paperbot.core import (
     apply_secondary_metrics_to_records,
     backfill_journal_metrics_from_record_issns,
     build_collection_paths,
+    collect_collection_tree_keys,
     chunked,
     ensure_collection_path,
     fetch_pubmed_xml,
@@ -869,6 +870,7 @@ def scan_zotero_items_for_enrichment(
     zotero_api_key: str,
     target_collection_path: str,
     enrich_scope: str,
+    include_subcollections: bool,
     max_items: int | None,
     only_select_missing_metrics: bool,
     openalex_email: str,
@@ -878,6 +880,7 @@ def scan_zotero_items_for_enrichment(
     scope = enrich_scope if enrich_scope in {"library", "collection"} else "library"
     normalized_target_path = normalize_collection_path(target_collection_path)
     collection_key: str | None = None
+    collection_keys_to_scan: list[str] = []
     if scope == "collection":
         if not normalized_target_path:
             raise ValueError(
@@ -889,14 +892,54 @@ def scan_zotero_items_for_enrichment(
             zotero_api_key=zotero_api_key,
             target_collection_path=normalized_target_path,
         )
+        if include_subcollections:
+            collections = list_collections(
+                library_type=library_type,
+                library_id=validated_library_id,
+                api_key=zotero_api_key,
+            )
+            collection_keys_to_scan = collect_collection_tree_keys(
+                collections=collections,
+                root_key=collection_key,
+                include_root=True,
+            )
+        else:
+            collection_keys_to_scan = [collection_key]
 
-    items = list_zotero_items(
-        library_type=library_type,
-        library_id=validated_library_id,
-        api_key=zotero_api_key,
-        collection_key=collection_key,
-        limit=max_items,
-    )
+    items: list[dict[str, Any]] = []
+    if scope == "collection":
+        remaining = max_items
+        seen_item_keys: set[str] = set()
+        for current_collection_key in collection_keys_to_scan:
+            current_limit = remaining
+            batch_items = list_zotero_items(
+                library_type=library_type,
+                library_id=validated_library_id,
+                api_key=zotero_api_key,
+                collection_key=current_collection_key,
+                limit=current_limit,
+            )
+            for item in batch_items:
+                item_key = str(item.get("key", "")).strip()
+                if item_key and item_key in seen_item_keys:
+                    continue
+                if item_key:
+                    seen_item_keys.add(item_key)
+                items.append(item)
+                if remaining is not None:
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
+            if remaining is not None and remaining <= 0:
+                break
+    else:
+        items = list_zotero_items(
+            library_type=library_type,
+            library_id=validated_library_id,
+            api_key=zotero_api_key,
+            collection_key=None,
+            limit=max_items,
+        )
     records = [dict(item) for item in items if str(item.get("title", "")).strip()]
 
     pmids = [
@@ -964,6 +1007,7 @@ def scan_zotero_items_for_enrichment(
         "library_id": validated_library_id,
         "target_collection_path": normalized_target_path,
         "enrich_scope": scope,
+        "include_subcollections": bool(include_subcollections),
         "max_items": int(max_items) if max_items is not None else None,
         "display_records": records,
         "metrics_by_pmid": metrics_by_pmid,
@@ -2058,6 +2102,13 @@ def render_zotero_enrich_section(
         key="enrich_scope",
         format_func=lambda value: "Target collection" if value == "collection" else "Whole library",
     )
+    include_subcollections = st.checkbox(
+        "Include subcollections",
+        value=bool(st.session_state.get("enrich_include_subcollections", True)),
+        key="enrich_include_subcollections",
+        help="When scanning a target collection, include items from child collections too.",
+        disabled=enrich_scope != "collection",
+    )
     no_enrich_limit = st.checkbox(
         "No scan limit",
         value=bool(st.session_state.get("enrich_no_limit", False)),
@@ -2113,6 +2164,7 @@ def render_zotero_enrich_section(
                     zotero_api_key=zotero_api_key.strip(),
                     target_collection_path=selected_existing_path or manual_collection_path,
                     enrich_scope=enrich_scope,
+                    include_subcollections=include_subcollections,
                     max_items=enrich_max_items,
                     only_select_missing_metrics=only_select_missing_metrics,
                     openalex_email=openalex_email,
@@ -2145,6 +2197,11 @@ def render_zotero_enrich_section(
         st.caption("Scan limit: no limit")
     else:
         st.caption(f"Scan limit: first {int(enrich_payload.get('max_items', 0))} items in scope")
+    if enrich_payload.get("enrich_scope") == "collection":
+        st.caption(
+            "Subcollections: "
+            + ("included" if enrich_payload.get("include_subcollections", True) else "not included")
+        )
     st.caption(
         f"Scan target: {format_execution_context(
             library_type=library_type,
@@ -2210,6 +2267,7 @@ def render_zotero_enrich_section(
                 "key": row.get("key"),
                 "version": row.get("version"),
                 "extra": row.get("extra", ""),
+                "tags": list(row.get("tags", []) or []),
             }
             for row in update_candidates
             if row.get("key")
@@ -2252,6 +2310,7 @@ def render_zotero_enrich_section(
             if row_key in updated_keys:
                 updated = updated_by_key[row_key]
                 row["extra"] = updated.get("extra", row.get("extra", ""))
+                row["tags"] = list(updated.get("tags", row.get("tags", [])) or [])
                 row["_has_existing_metrics"] = True
                 row["_enrich_status"] = "already_enriched"
                 row["_selected"] = False
@@ -2566,6 +2625,8 @@ if "ambiguous_collection_paths" not in st.session_state:
     st.session_state["ambiguous_collection_paths"] = {}
 if "enrich_scope" not in st.session_state:
     st.session_state["enrich_scope"] = "collection"
+if "enrich_include_subcollections" not in st.session_state:
+    st.session_state["enrich_include_subcollections"] = True
 if "enrich_max_items" not in st.session_state:
     st.session_state["enrich_max_items"] = 200
 if "enrich_no_limit" not in st.session_state:
