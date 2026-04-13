@@ -272,50 +272,13 @@ def refresh_payload_records(
             st.stop()
 
 
-def validate_and_refresh_payload_status(
+def is_payload_status_current(
     *,
     payload_state_key: str,
     current_evaluation_signature: str,
-    library_type: str,
-    library_id: str,
-    zotero_api_key: str,
-    target_collection_path: str,
-    duplicate_scope: str,
-    skip_duplicates: bool,
-) -> None:
-    """Validate and refresh payload status, auto-refresh if signatures don't match.
-
-    Args:
-        payload_state_key: The session state key for the payload
-        current_evaluation_signature: The current execution signature
-        library_type: Zotero library type
-        library_id: Zotero library ID
-        zotero_api_key: Zotero API key
-        target_collection_path: Target collection path
-        duplicate_scope: Duplicate checking scope
-        skip_duplicates: Whether to skip duplicates
-    """
+) -> bool:
     payload = dict(st.session_state.get(payload_state_key, {}))
-    if str(payload.get("evaluation_signature", "")) != current_evaluation_signature:
-        st.warning(
-            "Status markers were refreshed to match the current form. "
-            "Review the list and click import again."
-        )
-        with st.spinner("Refreshing statuses using current form..."):
-            try:
-                reevaluate_payload_records(
-                    payload_state_key=payload_state_key,
-                    library_type=library_type,
-                    library_id=validate_library_id(library_type, library_id),
-                    zotero_api_key=zotero_api_key.strip(),
-                    target_collection_path=normalize_collection_path(target_collection_path),
-                    duplicate_scope=duplicate_scope,
-                    skip_duplicates=skip_duplicates,
-                )
-            except Exception as exc:
-                st.error(f"Failed to refresh statuses: {exc}")
-                st.stop()
-        st.rerun()
+    return str(payload.get("evaluation_signature", "")) == current_evaluation_signature
 
 
 def load_settings() -> dict[str, Any]:
@@ -912,11 +875,6 @@ def render_selectable_records_editor(
                 "Action": action_label(
                     str(record.get("_planned_action") or record.get("planned_action", "create"))
                 ),
-                "Title": record.get("title", ""),
-                "Journal": record.get("publicationTitle") or record.get("journal", ""),
-                "Date": record.get("date", ""),
-                "PMID": record.get("PMID") or record.get("pmid", ""),
-                "DOI": record.get("DOI") or record.get("doi", ""),
                 "Cited By": _display_int(
                     first_present_value(
                         record.get("_metric_citation_count"),
@@ -937,6 +895,11 @@ def render_selectable_records_editor(
                     ),
                     digits=2,
                 ),
+                "Title": record.get("title", ""),
+                "Journal": record.get("publicationTitle") or record.get("journal", ""),
+                "Date": record.get("date", ""),
+                "PMID": record.get("PMID") or record.get("pmid", ""),
+                "DOI": record.get("DOI") or record.get("doi", ""),
             }
             for record in display_records
         ]
@@ -1146,9 +1109,13 @@ def render_history_section(
         skip_duplicates=skip_duplicates,
         duplicate_scope=duplicate_scope,
     )
-    history_status_current = (
-        str(history_payload.get("evaluation_signature", "")) == current_history_signature
+    history_status_current = is_payload_status_current(
+        payload_state_key=history_payload_key,
+        current_evaluation_signature=current_history_signature,
     )
+    history_outdated_confirm_key = f"{history_payload_key}::outdated_confirm"
+    if history_status_current:
+        st.session_state.pop(history_outdated_confirm_key, None)
     if history_status_current:
         st.caption(
             "Current duplicate/status markers are already aligned with the current form."
@@ -1184,8 +1151,31 @@ def render_history_section(
             "Load config",
             key=f"load_history_{selected_history_id}",
         )
+    history_recheck_now = False
+    history_import_anyway = False
+    if (
+        not history_status_current
+        and st.session_state.get(history_outdated_confirm_key) == current_history_signature
+    ):
+        st.warning(
+            "Current statuses were computed with an older form configuration. "
+            "Choose Re-check now or Import anyway."
+        )
+        confirm_col1, confirm_col2 = st.columns(2)
+        with confirm_col1:
+            history_recheck_now = st.button(
+                "Re-check now",
+                key=f"recheck_now_history_{selected_history_id}",
+            )
+        with confirm_col2:
+            history_import_anyway = st.button(
+                "Import anyway",
+                key=f"import_anyway_history_{selected_history_id}",
+            )
+        if history_import_anyway:
+            st.session_state.pop(history_outdated_confirm_key, None)
 
-    if import_from_history:
+    if import_from_history or history_import_anyway:
         target_library_id = resolved_library_id
         target_library_type = library_type
         target_collection_path = normalize_collection_path(
@@ -1202,23 +1192,9 @@ def render_history_section(
         except ValueError as exc:
             st.error(str(exc))
             st.stop()
-
-        validate_and_refresh_payload_status(
-            payload_state_key=history_payload_key,
-            current_evaluation_signature=build_execution_signature(
-                library_type=target_library_type,
-                library_id=target_library_id,
-                target_collection_path=target_collection_path,
-                skip_duplicates=skip_duplicates,
-                duplicate_scope=duplicate_scope,
-            ),
-            library_type=target_library_type,
-            library_id=target_library_id,
-            zotero_api_key=zotero_api_key,
-            target_collection_path=target_collection_path,
-            duplicate_scope=duplicate_scope,
-            skip_duplicates=skip_duplicates,
-        )
+        if import_from_history and not history_status_current:
+            st.session_state[history_outdated_confirm_key] = current_history_signature
+            st.rerun()
 
         current_history_payload = dict(st.session_state.get(history_payload_key, {}))
         history_import_display_records = list(
@@ -1281,7 +1257,8 @@ def render_history_section(
                 f"History import finished. Success: {total_success}, Failed: {total_failed}."
             )
 
-    if refresh_history_status:
+    if refresh_history_status or history_recheck_now:
+        st.session_state.pop(history_outdated_confirm_key, None)
         (
             skipped_existing,
             skipped_incoming,
@@ -1373,9 +1350,13 @@ def render_preview_cache_section(
         skip_duplicates=skip_duplicates,
         duplicate_scope=duplicate_scope,
     )
-    preview_status_current = (
-        str(preview_payload.get("evaluation_signature", "")) == current_preview_signature
+    preview_status_current = is_payload_status_current(
+        payload_state_key="preview_payload",
+        current_evaluation_signature=current_preview_signature,
     )
+    preview_outdated_confirm_key = "preview_payload::outdated_confirm"
+    if preview_status_current:
+        st.session_state.pop(preview_outdated_confirm_key, None)
     if preview_status_current:
         st.caption("Preview duplicate/status markers are aligned with the current form.")
     else:
@@ -1410,13 +1391,37 @@ def render_preview_cache_section(
         refresh_preview_status = st.button("Re-check status")
     with cache_col3:
         clear_preview_cache = st.button("Clear preview")
+    preview_recheck_now = False
+    preview_import_anyway = False
+    if (
+        not preview_status_current
+        and st.session_state.get(preview_outdated_confirm_key) == current_preview_signature
+    ):
+        st.warning(
+            "Current preview statuses were computed with an older form configuration. "
+            "Choose Re-check now or Import anyway."
+        )
+        confirm_col1, confirm_col2 = st.columns(2)
+        with confirm_col1:
+            preview_recheck_now = st.button(
+                "Re-check now",
+                key="recheck_now_preview",
+            )
+        with confirm_col2:
+            preview_import_anyway = st.button(
+                "Import anyway",
+                key="import_anyway_preview",
+            )
+        if preview_import_anyway:
+            st.session_state.pop(preview_outdated_confirm_key, None)
 
     if clear_preview_cache:
         st.session_state.pop("preview_payload", None)
         st.success("Preview cache cleared.")
         st.rerun()
 
-    if refresh_preview_status:
+    if refresh_preview_status or preview_recheck_now:
+        st.session_state.pop(preview_outdated_confirm_key, None)
         (
             skipped_existing,
             skipped_incoming,
@@ -1449,7 +1454,7 @@ def render_preview_cache_section(
         )
         st.rerun()
 
-    if import_preview_now:
+    if import_preview_now or preview_import_anyway:
         current_library_type = library_type
         current_library_id = resolved_library_id
         current_target_collection_path = normalize_collection_path(
@@ -1470,17 +1475,9 @@ def render_preview_cache_section(
         except ValueError as exc:
             st.error(f"Current form library ID invalid: {exc}")
             st.stop()
-
-        validate_and_refresh_payload_status(
-            payload_state_key="preview_payload",
-            current_evaluation_signature=current_preview_signature,
-            library_type=current_library_type,
-            library_id=current_library_id,
-            zotero_api_key=zotero_api_key,
-            target_collection_path=current_target_collection_path,
-            duplicate_scope=duplicate_scope,
-            skip_duplicates=skip_duplicates,
-        )
+        if import_preview_now and not preview_status_current:
+            st.session_state[preview_outdated_confirm_key] = current_preview_signature
+            st.rerun()
 
         current_preview_payload = dict(st.session_state.get("preview_payload", {}))
         preview_import_display_records = list(
@@ -1992,11 +1989,6 @@ if run:
     result_df = pd.DataFrame(
         [
             {
-                "Title": record.get("title", ""),
-                "Journal": record.get("publicationTitle", ""),
-                "Date": record.get("date", ""),
-                "DOI": record.get("DOI", ""),
-                "PMID": record.get("PMID", ""),
                 "Dedup Status": record.get("_dedup_status", "new"),
                 "Planned Action": record.get("_planned_action", "create"),
                 "Will Import": bool(record.get("_will_import", True)),
@@ -2009,6 +2001,11 @@ if run:
                     record.get("_metric_hybrid_score"),
                     digits=2,
                 ),
+                "Title": record.get("title", ""),
+                "Journal": record.get("publicationTitle", ""),
+                "Date": record.get("date", ""),
+                "DOI": record.get("DOI", ""),
+                "PMID": record.get("PMID", ""),
                 "URL": record.get("url", ""),
             }
             for record in display_records
