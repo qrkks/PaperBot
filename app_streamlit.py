@@ -2,4 +2,9 @@
 
 from __future__ import annotations
 
-from paperbot.web import *  # noqa: F401,F403
+from pathlib import Path
+import runpy
+
+WEB_APP = Path(__file__).resolve().parent / "paperbot" / "web.py"
+
+runpy.run_path(str(WEB_APP), run_name="__main__")

@@ -10,7 +10,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from .core import (
+from paperbot.core import (
     PUBMED_SORT_VALUES,
     SECONDARY_SORT_VALUES,
     apply_secondary_metrics_to_records,
@@ -807,7 +807,7 @@ def render_selectable_records_editor(
     edited_df = st.data_editor(
         styled_editor_df,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key=(
             f"{key_prefix}_editor_{token}_"
             f"{st.session_state.get(editor_version_state_key, 0)}"
@@ -1067,7 +1067,7 @@ if history_entries:
         }
         for item in history_entries
     ]
-    st.dataframe(history_summary, use_container_width=True, hide_index=True)
+    st.dataframe(history_summary, width="stretch", hide_index=True)
 
     history_labels = [
         f"{item.get('created_at', '')} | {item.get('event_type', '')} | {item.get('query', '')}"
@@ -1754,7 +1754,7 @@ if run:
             }
             for record in display_records
         ],
-        use_container_width=True,
+        width="stretch",
     )
 
     st.info(
