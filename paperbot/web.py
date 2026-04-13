@@ -23,6 +23,7 @@ from paperbot.core import (
     find_ambiguous_collection_paths,
     list_collections,
     list_existing_items_info,
+    list_zotero_items,
     normalize_collection_path,
     parse_pubmed_articles,
     plan_record_import_actions,
@@ -31,6 +32,7 @@ from paperbot.core import (
     validate_library_id,
     zotero_create_items,
     zotero_link_existing_items_to_collection,
+    zotero_update_items,
 )
 from paperbot.ui_state import (
     coerce_history_entry_id,
@@ -802,6 +804,311 @@ def status_style(value: Any) -> str:
     if text == "existing_add_to_collection":
         return "background-color: #e8f1ff; color: #1d4ed8; font-weight: 600;"
     return "background-color: #f3f4f6; color: #374151;"
+
+
+def enrich_status_label(status: str) -> str:
+    mapping = {
+        "ready": "ready_to_enrich",
+        "already_enriched": "already_enriched",
+        "missing_pmid": "missing_pmid",
+        "no_metrics": "no_metrics_found",
+    }
+    return mapping.get(status, "unknown")
+
+
+def enrich_status_style(value: Any) -> str:
+    text = str(value)
+    if text == "ready_to_enrich":
+        return "background-color: #e8f7ea; color: #17653a; font-weight: 600;"
+    if text == "already_enriched":
+        return "background-color: #e8f1ff; color: #1d4ed8; font-weight: 600;"
+    if text == "missing_pmid":
+        return "background-color: #fff4e5; color: #9a5b00; font-weight: 600;"
+    if text == "no_metrics_found":
+        return "background-color: #f3f4f6; color: #374151; font-weight: 600;"
+    return "background-color: #f3f4f6; color: #374151;"
+
+
+def has_paperbot_metrics(extra_value: Any) -> bool:
+    managed_prefixes = (
+        "OpenAlex Cited By:",
+        "OpenAlex Journal 2yr Mean Citedness:",
+        "OpenAlex Source:",
+        "Secondary Sort:",
+        "Metrics Snapshot Date:",
+    )
+    for line in str(extra_value or "").splitlines():
+        if line.strip().startswith(managed_prefixes):
+            return True
+    return False
+
+
+def resolve_existing_collection_key(
+    *,
+    library_type: str,
+    library_id: str,
+    zotero_api_key: str,
+    target_collection_path: str,
+) -> str | None:
+    normalized_target = normalize_collection_path(target_collection_path)
+    if not normalized_target:
+        return None
+    return ensure_collection_path(
+        library_type=library_type,
+        library_id=library_id,
+        api_key=zotero_api_key,
+        collection_path=normalized_target,
+        auto_create=False,
+    )
+
+
+def scan_zotero_items_for_enrichment(
+    *,
+    library_type: str,
+    library_id: str,
+    zotero_api_key: str,
+    target_collection_path: str,
+    enrich_scope: str,
+    max_items: int | None,
+    only_select_missing_metrics: bool,
+    openalex_email: str,
+    openalex_api_key: str,
+) -> dict[str, Any]:
+    validated_library_id = validate_library_id(library_type, library_id)
+    scope = enrich_scope if enrich_scope in {"library", "collection"} else "library"
+    normalized_target_path = normalize_collection_path(target_collection_path)
+    collection_key: str | None = None
+    if scope == "collection":
+        if not normalized_target_path:
+            raise ValueError(
+                "Target collection scope requires a collection path or dropdown selection."
+            )
+        collection_key = resolve_existing_collection_key(
+            library_type=library_type,
+            library_id=validated_library_id,
+            zotero_api_key=zotero_api_key,
+            target_collection_path=normalized_target_path,
+        )
+
+    items = list_zotero_items(
+        library_type=library_type,
+        library_id=validated_library_id,
+        api_key=zotero_api_key,
+        collection_key=collection_key,
+        limit=max_items,
+    )
+    records = [dict(item) for item in items if str(item.get("title", "")).strip()]
+
+    pmids = [
+        str(record.get("PMID", "")).strip()
+        for record in records
+        if str(record.get("PMID", "")).strip()
+    ]
+    metrics_by_pmid = fetch_openalex_metrics_by_pmids(
+        pmids=pmids,
+        email=openalex_email.strip() or None,
+        api_key=openalex_api_key.strip() or None,
+    )
+    metrics_by_pmid = backfill_journal_metrics_from_record_issns(
+        records=records,
+        metrics_by_pmid=metrics_by_pmid,
+        email=openalex_email.strip() or None,
+        api_key=openalex_api_key.strip() or None,
+    )
+    apply_secondary_metrics_to_records(
+        records=records,
+        metrics_by_pmid=metrics_by_pmid,
+        secondary_sort="none",
+        attach_to_extra=False,
+    )
+
+    ready_count = 0
+    already_enriched_count = 0
+    missing_pmid_count = 0
+    no_metrics_count = 0
+    for record in records:
+        has_existing_metrics = has_paperbot_metrics(record.get("extra"))
+        has_metric_data = any(
+            record.get(metric_key) is not None
+            and record.get(metric_key) != ""
+            for metric_key in (
+                "_metric_citation_count",
+                "_metric_journal_2yr_mean_citedness",
+            )
+        )
+        has_pmid = bool(str(record.get("PMID", "") or "").strip())
+        if not has_pmid:
+            status = "missing_pmid"
+            missing_pmid_count += 1
+        elif not has_metric_data:
+            status = "no_metrics"
+            no_metrics_count += 1
+        elif has_existing_metrics:
+            status = "already_enriched"
+            already_enriched_count += 1
+        else:
+            status = "ready"
+            ready_count += 1
+
+        record["_enrich_status"] = status
+        record["_has_existing_metrics"] = has_existing_metrics
+        record["_has_metric_data"] = has_metric_data
+        record["_selected"] = bool(
+            has_metric_data
+            and (not only_select_missing_metrics or not has_existing_metrics)
+        )
+
+    return {
+        "created_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "library_type": library_type,
+        "library_id": validated_library_id,
+        "target_collection_path": normalized_target_path,
+        "enrich_scope": scope,
+        "max_items": int(max_items) if max_items is not None else None,
+        "display_records": records,
+        "metrics_by_pmid": metrics_by_pmid,
+        "summary": {
+            "scanned": len(records),
+            "ready": ready_count,
+            "already_enriched": already_enriched_count,
+            "missing_pmid": missing_pmid_count,
+            "no_metrics": no_metrics_count,
+        },
+    }
+
+
+def render_enrich_records_editor(
+    *,
+    payload: dict[str, Any],
+    payload_state_key: str,
+    key_prefix: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    display_records = list(payload.get("display_records", []))
+    for record in display_records:
+        if "_selected" not in record:
+            record["_selected"] = bool(record.get("_has_metric_data", False))
+
+    token = str(payload.get("created_at", "default"))
+    editor_version_state_key = f"{key_prefix}_editor_version::{token}"
+    if editor_version_state_key not in st.session_state:
+        st.session_state[editor_version_state_key] = 0
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        select_missing = st.button(
+            "Select missing metrics",
+            key=f"{key_prefix}_select_missing_{token}",
+        )
+    with col2:
+        select_ready = st.button(
+            "Select all ready",
+            key=f"{key_prefix}_select_ready_{token}",
+        )
+    with col3:
+        select_none = st.button(
+            "Select none",
+            key=f"{key_prefix}_select_none_{token}",
+        )
+
+    changed = False
+    if select_missing:
+        for record in display_records:
+            record["_selected"] = bool(
+                record.get("_has_metric_data", False)
+                and not record.get("_has_existing_metrics", False)
+            )
+        changed = True
+    if select_ready:
+        for record in display_records:
+            record["_selected"] = bool(record.get("_has_metric_data", False))
+        changed = True
+    if select_none:
+        for record in display_records:
+            record["_selected"] = False
+        changed = True
+
+    if changed:
+        selected_records = [row for row in display_records if row.get("_selected", False)]
+        payload["display_records"] = display_records
+        payload["selected_records"] = selected_records
+        st.session_state[payload_state_key] = payload
+        st.session_state[editor_version_state_key] = (
+            int(st.session_state[editor_version_state_key]) + 1
+        )
+        st.rerun()
+
+    editor_df = pd.DataFrame(
+        [
+            {
+                "Select": bool(record.get("_selected", False)),
+                "Status": enrich_status_label(
+                    str(record.get("_enrich_status", "ready"))
+                ),
+                "Cited By": _display_int(record.get("_metric_citation_count")),
+                "Journal Metric": _display_float(
+                    record.get("_metric_journal_2yr_mean_citedness"),
+                    digits=4,
+                ),
+                "Hybrid Score": _display_float(
+                    record.get("_metric_hybrid_score"),
+                    digits=2,
+                ),
+                "Title": record.get("title", ""),
+                "Journal": record.get("publicationTitle", ""),
+                "Date": record.get("date", ""),
+                "PMID": record.get("PMID", ""),
+                "DOI": record.get("DOI", ""),
+            }
+            for record in display_records
+        ]
+    )
+    styled_df = editor_df.style.map(enrich_status_style, subset=["Status"])
+    edited_df = st.data_editor(
+        styled_df,
+        hide_index=True,
+        width="stretch",
+        key=(
+            f"{key_prefix}_editor_{token}_"
+            f"{st.session_state.get(editor_version_state_key, 0)}"
+        ),
+        column_config={
+            "Select": st.column_config.CheckboxColumn("Select"),
+            "Cited By": st.column_config.NumberColumn("Cited By", format="%d"),
+            "Journal Metric": st.column_config.NumberColumn(
+                "Journal Metric", format="%.4f"
+            ),
+            "Hybrid Score": st.column_config.NumberColumn(
+                "Hybrid Score", format="%.2f"
+            ),
+        },
+        disabled=[
+            "Status",
+            "Cited By",
+            "Journal Metric",
+            "Hybrid Score",
+            "Title",
+            "Journal",
+            "Date",
+            "PMID",
+            "DOI",
+        ],
+    )
+    for idx, row in edited_df.iterrows():
+        display_records[idx]["_selected"] = bool(row.get("Select", False))
+
+    selected_records = [row for row in display_records if row.get("_selected", False)]
+    payload["display_records"] = display_records
+    payload["selected_records"] = selected_records
+    st.session_state[payload_state_key] = payload
+
+    st.caption(
+        "Legend: green = ready to enrich, blue = already enriched, amber = missing PMID, gray = no OpenAlex metrics found"
+    )
+    st.caption(
+        f"Current selection: {len(selected_records)} | "
+        f"metrics-ready selected: {sum(1 for row in selected_records if row.get('_has_metric_data', False))}"
+    )
+    return display_records, selected_records
 
 
 def render_selectable_records_editor(
@@ -1730,6 +2037,516 @@ def execute_search_pipeline(
     }
 
 
+def render_zotero_enrich_section(
+    *,
+    library_type: str,
+    resolved_library_id: str,
+    selected_existing_path: str,
+    manual_collection_path: str,
+    zotero_api_key: str,
+    openalex_email: str,
+    openalex_api_key: str,
+) -> None:
+    st.subheader("Zotero Enrich")
+    st.caption(
+        "Scan existing Zotero items, fetch OpenAlex metrics, and write them into Zotero extra."
+    )
+
+    enrich_scope = st.selectbox(
+        "Enrich scope",
+        options=["collection", "library"],
+        key="enrich_scope",
+        format_func=lambda value: "Target collection" if value == "collection" else "Whole library",
+    )
+    no_enrich_limit = st.checkbox(
+        "No scan limit",
+        value=bool(st.session_state.get("enrich_no_limit", False)),
+        key="enrich_no_limit",
+        help="Scan all items in the selected scope. This may be slow for large libraries.",
+    )
+    enrich_max_items: int | None = None
+    if not no_enrich_limit:
+        enrich_max_items = int(
+            st.number_input(
+                "Items to scan this time",
+                min_value=1,
+                max_value=1000,
+                value=int(st.session_state.get("enrich_max_items", 200)),
+                step=10,
+                key="enrich_max_items",
+                help="Use a smaller number for faster scans.",
+            )
+        )
+    only_select_missing_metrics = st.checkbox(
+        "Preselect only items missing existing PaperBot metrics",
+        value=bool(st.session_state.get("enrich_only_missing_metrics", True)),
+        key="enrich_only_missing_metrics",
+    )
+    overwrite_existing_metrics = st.checkbox(
+        "Overwrite existing PaperBot metric lines when updating",
+        value=bool(st.session_state.get("enrich_overwrite_existing_metrics", False)),
+        key="enrich_overwrite_existing_metrics",
+    )
+
+    enrich_action_col1, enrich_action_col2 = st.columns(2)
+    with enrich_action_col1:
+        scan_enrich = st.button("Scan Zotero items", key="scan_zotero_enrich")
+    with enrich_action_col2:
+        clear_enrich = st.button("Clear enrich scan", key="clear_zotero_enrich")
+
+    if clear_enrich:
+        st.session_state.pop("enrich_payload", None)
+        st.rerun()
+
+    if scan_enrich:
+        if not resolved_library_id:
+            st.error("Please provide Zotero user ID or library ID before scanning.")
+            st.stop()
+        if not zotero_api_key.strip():
+            st.error("Scanning existing Zotero items requires Zotero API key.")
+            st.stop()
+        with st.spinner("Scanning Zotero and fetching metrics..."):
+            try:
+                st.session_state["enrich_payload"] = scan_zotero_items_for_enrichment(
+                    library_type=library_type,
+                    library_id=resolved_library_id,
+                    zotero_api_key=zotero_api_key.strip(),
+                    target_collection_path=selected_existing_path or manual_collection_path,
+                    enrich_scope=enrich_scope,
+                    max_items=enrich_max_items,
+                    only_select_missing_metrics=only_select_missing_metrics,
+                    openalex_email=openalex_email,
+                    openalex_api_key=openalex_api_key,
+                )
+            except Exception as exc:
+                st.error(f"Zotero enrich scan failed: {exc}")
+                st.stop()
+        st.rerun()
+
+    enrich_payload = st.session_state.get("enrich_payload")
+    if not enrich_payload:
+        st.caption("No enrich scan yet. Scan a collection or your library to review update candidates.")
+        return
+
+    summary = enrich_payload.get("summary", {}) or {}
+    scope_label = (
+        "target collection"
+        if enrich_payload.get("enrich_scope") == "collection"
+        else "whole library"
+    )
+    st.info(
+        f"Scanned {summary.get('scanned', 0)} items from {scope_label}. "
+        f"Ready: {summary.get('ready', 0)} | "
+        f"Already enriched: {summary.get('already_enriched', 0)} | "
+        f"Missing PMID: {summary.get('missing_pmid', 0)} | "
+        f"No metrics found: {summary.get('no_metrics', 0)}"
+    )
+    if enrich_payload.get("max_items") is None:
+        st.caption("Scan limit: no limit")
+    else:
+        st.caption(f"Scan limit: first {int(enrich_payload.get('max_items', 0))} items in scope")
+    st.caption(
+        f"Scan target: {format_execution_context(
+            library_type=library_type,
+            library_id=str(enrich_payload.get('library_id', resolved_library_id)),
+            target_collection_path=str(enrich_payload.get('target_collection_path', '')),
+            duplicate_scope='collection' if enrich_payload.get('enrich_scope') == 'collection' else 'library',
+        )}"
+    )
+
+    enrich_display_records, selected_enrich_records = render_enrich_records_editor(
+        payload=dict(enrich_payload),
+        payload_state_key="enrich_payload",
+        key_prefix="zotero_enrich",
+    )
+
+    if st.button("Update selected extras", key="update_selected_enrich"):
+        if not zotero_api_key.strip():
+            st.error("Updating Zotero extra requires Zotero API key.")
+            st.stop()
+        if not resolved_library_id:
+            st.error("Please provide Zotero user ID or library ID before updating.")
+            st.stop()
+
+        update_candidates: list[dict[str, Any]] = []
+        skipped_no_metrics = 0
+        skipped_existing_metrics = 0
+        for row in selected_enrich_records:
+            if not row.get("_has_metric_data", False):
+                skipped_no_metrics += 1
+                continue
+            if row.get("_has_existing_metrics", False) and not overwrite_existing_metrics:
+                skipped_existing_metrics += 1
+                continue
+            update_candidates.append(dict(row))
+
+        if not update_candidates:
+            st.warning(
+                "No selected items are eligible for update. "
+                "Try selecting metrics-ready rows or enable overwrite for already enriched items."
+            )
+            st.stop()
+
+        metrics_by_pmid: dict[str, dict[str, Any]] = {}
+        for row in update_candidates:
+            pmid = str(row.get("PMID", "") or "").strip()
+            if pmid:
+                metrics_by_pmid[pmid] = {
+                    "citation_count": row.get("_metric_citation_count"),
+                    "journal_metric_2yr_mean_citedness": row.get(
+                        "_metric_journal_2yr_mean_citedness"
+                    ),
+                    "source_name": row.get("_metric_source_name", ""),
+                }
+
+        apply_secondary_metrics_to_records(
+            records=update_candidates,
+            metrics_by_pmid=metrics_by_pmid,
+            secondary_sort="none",
+            attach_to_extra=True,
+        )
+        payload_items = [
+            {
+                "key": row.get("key"),
+                "version": row.get("version"),
+                "extra": row.get("extra", ""),
+            }
+            for row in update_candidates
+            if row.get("key")
+        ]
+
+        with st.spinner("Updating Zotero extra fields..."):
+            try:
+                result = zotero_update_items(
+                    library_type=library_type,
+                    library_id=validate_library_id(library_type, resolved_library_id),
+                    api_key=zotero_api_key.strip(),
+                    items=payload_items,
+                )
+            except Exception as exc:
+                st.error(f"Zotero enrich update failed: {exc}")
+                st.stop()
+
+        successful_indexes = {
+            int(index)
+            for index in (result.get("successful", {}) or {}).keys()
+            if str(index).isdigit()
+        }
+        updated_keys = {
+            str(payload_items[idx].get("key", "")).strip()
+            for idx in successful_indexes
+            if 0 <= idx < len(payload_items)
+        }
+        if not updated_keys and len(result.get("failed", {}) or {}) == 0:
+            updated_keys = {
+                str(item.get("key", "")).strip()
+                for item in payload_items
+                if str(item.get("key", "")).strip()
+            }
+
+        updated_by_key = {
+            str(item.get("key", "")).strip(): item for item in update_candidates
+        }
+        for row in enrich_display_records:
+            row_key = str(row.get("key", "")).strip()
+            if row_key in updated_keys:
+                updated = updated_by_key[row_key]
+                row["extra"] = updated.get("extra", row.get("extra", ""))
+                row["_has_existing_metrics"] = True
+                row["_enrich_status"] = "already_enriched"
+                row["_selected"] = False
+
+        enrich_payload["display_records"] = enrich_display_records
+        enrich_payload["selected_records"] = [
+            row for row in enrich_display_records if row.get("_selected", False)
+        ]
+        summary["already_enriched"] = sum(
+            1 for row in enrich_display_records if row.get("_has_existing_metrics", False)
+        )
+        summary["ready"] = sum(
+            1
+            for row in enrich_display_records
+            if row.get("_has_metric_data", False)
+            and not row.get("_has_existing_metrics", False)
+        )
+        enrich_payload["summary"] = summary
+        st.session_state["enrich_payload"] = enrich_payload
+
+        total_success = len(result.get("successful", {}) or {})
+        total_failed = len(result.get("failed", {}) or {})
+        extra_notes: list[str] = []
+        if skipped_no_metrics:
+            extra_notes.append(f"skipped no-metric rows={skipped_no_metrics}")
+        if skipped_existing_metrics:
+            extra_notes.append(
+                f"skipped already-enriched rows={skipped_existing_metrics}"
+            )
+        suffix = f" ({'; '.join(extra_notes)})" if extra_notes else ""
+        st.success(
+            f"Zotero enrich finished. Success: {total_success}, Failed: {total_failed}.{suffix}"
+        )
+
+
+def render_pubmed_import_section(
+    *,
+    library_type: str,
+    zotero_user_id: str,
+    zotero_api_key: str,
+    resolved_library_id: str,
+    selected_existing_path: str,
+    manual_collection_path: str,
+    auto_create_collection: bool,
+    pubmed_sort: str,
+    secondary_sort: str,
+    attach_metrics_to_extra: bool,
+    skip_duplicates: bool,
+    duplicate_scope: str,
+    ncbi_email: str,
+    ncbi_api_key: str,
+    openalex_email: str,
+    openalex_api_key: str,
+    remember_settings: bool,
+) -> None:
+    query = st.text_input(
+        "PubMed query",
+        placeholder="e.g. glioblastoma AND immunotherapy",
+    )
+    max_results = st.number_input(
+        "Max results", min_value=1, max_value=500, value=20, step=1
+    )
+    dry_run = st.checkbox("Preview only (do not write to Zotero)", value=True)
+    run_button_label = "Run preview" if dry_run else "Run and import"
+    run = st.button(run_button_label)
+
+    history_entries = list(st.session_state.get("history_entries", []))
+    render_history_section(
+        history_entries=history_entries,
+        library_type=library_type,
+        resolved_library_id=resolved_library_id,
+        selected_existing_path=selected_existing_path,
+        manual_collection_path=manual_collection_path,
+        duplicate_scope=duplicate_scope,
+        skip_duplicates=skip_duplicates,
+        zotero_api_key=zotero_api_key,
+        auto_create_collection=auto_create_collection,
+    )
+
+    preview_payload = st.session_state.get("preview_payload")
+    if preview_payload:
+        render_preview_cache_section(
+            preview_payload=preview_payload,
+            library_type=library_type,
+            resolved_library_id=resolved_library_id,
+            selected_existing_path=selected_existing_path,
+            manual_collection_path=manual_collection_path,
+            duplicate_scope=duplicate_scope,
+            skip_duplicates=skip_duplicates,
+            zotero_api_key=zotero_api_key,
+            auto_create_collection=auto_create_collection,
+            remember_settings=remember_settings,
+        )
+
+    if not run:
+        return
+
+    run_result = execute_search_pipeline(
+        query=query,
+        max_results=int(max_results),
+        dry_run=dry_run,
+        library_type=library_type,
+        zotero_user_id=zotero_user_id,
+        zotero_api_key=zotero_api_key,
+        resolved_library_id=resolved_library_id,
+        selected_existing_path=selected_existing_path,
+        manual_collection_path=manual_collection_path,
+        pubmed_sort=pubmed_sort,
+        secondary_sort=secondary_sort,
+        attach_metrics_to_extra=attach_metrics_to_extra,
+        skip_duplicates=skip_duplicates,
+        duplicate_scope=duplicate_scope,
+        ncbi_email=ncbi_email,
+        ncbi_api_key=ncbi_api_key,
+        openalex_email=openalex_email,
+        openalex_api_key=openalex_api_key,
+    )
+
+    validated_library_id = str(run_result["validated_library_id"])
+    target_collection_path = str(run_result["target_collection_path"])
+    display_records = list(run_result["display_records"])
+    import_records = list(run_result["import_records"])
+    skipped_existing = int(run_result["skipped_existing"])
+    skipped_incoming = int(run_result["skipped_incoming"])
+    link_existing = int(run_result["link_existing"])
+
+    st.success(
+        f"Fetched {len(display_records)} records. "
+        f"Importable after dedup: {len(import_records)}."
+    )
+    result_df = pd.DataFrame(
+        [
+            {
+                "Dedup Status": record.get("_dedup_status", "new"),
+                "Planned Action": record.get("_planned_action", "create"),
+                "Will Import": bool(record.get("_will_import", True)),
+                "Cited By": _display_int(record.get("_metric_citation_count")),
+                "Journal Metric": _display_float(
+                    record.get("_metric_journal_2yr_mean_citedness"),
+                    digits=4,
+                ),
+                "Hybrid Score": _display_float(
+                    record.get("_metric_hybrid_score"),
+                    digits=2,
+                ),
+                "Title": record.get("title", ""),
+                "Journal": record.get("publicationTitle", ""),
+                "Date": record.get("date", ""),
+                "DOI": record.get("DOI", ""),
+                "PMID": record.get("PMID", ""),
+                "URL": record.get("url", ""),
+            }
+            for record in display_records
+        ]
+    )
+    st.dataframe(
+        result_df,
+        width="stretch",
+        column_config={
+            "Cited By": st.column_config.NumberColumn("Cited By", format="%d"),
+            "Journal Metric": st.column_config.NumberColumn(
+                "Journal Metric", format="%.4f"
+            ),
+            "Hybrid Score": st.column_config.NumberColumn(
+                "Hybrid Score", format="%.2f"
+            ),
+        },
+    )
+
+    st.info(
+        f"PubMed sort: {pubmed_sort} | Secondary sort: {secondary_sort} | "
+        f"Attach metrics to extra: {attach_metrics_to_extra} | "
+        f"Skip duplicates: {skip_duplicates} ({duplicate_scope})"
+    )
+    if skipped_existing or skipped_incoming:
+        st.caption(
+            f"Dedup summary: skipped existing={skipped_existing}, "
+            f"skipped incoming duplicate={skipped_incoming}, "
+            f"link to collection={link_existing}"
+        )
+
+    if dry_run:
+        history_entry = build_history_entry(
+            event_type="preview",
+            query=query.strip(),
+            pubmed_sort=pubmed_sort,
+            secondary_sort=secondary_sort,
+            target_collection_path=target_collection_path,
+            duplicate_scope=duplicate_scope,
+            skip_duplicates=skip_duplicates,
+            library_type=library_type,
+            library_id=resolved_library_id,
+            display_records=display_records,
+            import_records=import_records,
+            skipped_existing=skipped_existing,
+            skipped_incoming=skipped_incoming,
+        )
+        append_history_entry(history_entry)
+        st.session_state["history_entries"] = load_history()
+        st.session_state["preview_payload"] = {
+            "created_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "query": query.strip(),
+            "display_records": display_records,
+            "import_records": import_records,
+            "skipped_existing": skipped_existing,
+            "skipped_incoming": skipped_incoming,
+            "library_type": library_type,
+            "library_id": resolved_library_id,
+            "target_collection_path": target_collection_path,
+            "auto_create_collection": auto_create_collection,
+            "pubmed_sort": pubmed_sort,
+            "secondary_sort": secondary_sort,
+            "skip_duplicates": skip_duplicates,
+            "duplicate_scope": duplicate_scope,
+            "evaluation_signature": build_execution_signature(
+                library_type=library_type,
+                library_id=resolved_library_id,
+                target_collection_path=target_collection_path,
+                skip_duplicates=skip_duplicates,
+                duplicate_scope=duplicate_scope,
+            ),
+        }
+        if remember_settings:
+            try:
+                save_settings(current_settings())
+            except Exception as exc:
+                st.warning(f"Could not save settings: {exc}")
+        st.success(
+            "Preview cache updated. Use the Preview Cache section if you want to import without re-querying."
+        )
+        if target_collection_path:
+            st.info(
+                f"Preview mode only. Target collection path: {target_collection_path}"
+            )
+        else:
+            st.info("Preview mode only. Target: library root.")
+        st.rerun()
+
+    if not import_records:
+        st.info("No new records to import after duplicate filtering.")
+        st.stop()
+
+    with st.spinner("Importing into Zotero..."):
+        try:
+            total_success, total_failed, resolved_collection_key = (
+                import_records_to_zotero(
+                    records=import_records,
+                    library_type=library_type,
+                    library_id=validated_library_id,
+                    zotero_api_key=zotero_api_key.strip(),
+                    target_collection_path=target_collection_path,
+                    auto_create_collection=auto_create_collection,
+                )
+            )
+        except Exception as exc:
+            st.error(f"Import failed: {exc}")
+            st.stop()
+
+    if remember_settings:
+        try:
+            save_settings(current_settings())
+        except Exception as exc:
+            st.warning(f"Could not save settings: {exc}")
+    history_entry = build_history_entry(
+        event_type="import",
+        query=query.strip(),
+        pubmed_sort=pubmed_sort,
+        secondary_sort=secondary_sort,
+        target_collection_path=target_collection_path,
+        duplicate_scope=duplicate_scope,
+        skip_duplicates=skip_duplicates,
+        library_type=library_type,
+        library_id=validated_library_id,
+        display_records=display_records,
+        import_records=import_records,
+        skipped_existing=skipped_existing,
+        skipped_incoming=skipped_incoming,
+        total_success=total_success,
+        total_failed=total_failed,
+    )
+    append_history_entry(history_entry)
+    st.session_state["history_entries"] = load_history()
+    st.session_state.pop("preview_payload", None)
+
+    if resolved_collection_key:
+        st.success(
+            f"Import finished. Success: {total_success}, Failed: {total_failed}. "
+            f"Collection key: {resolved_collection_key}"
+        )
+    else:
+        st.success(
+            f"Import finished. Success: {total_success}, Failed: {total_failed}."
+        )
+
+
 st.set_page_config(
     page_title="PubMed to Zotero", page_icon=":books:", layout="centered"
 )
@@ -1747,11 +2564,17 @@ if "collection_paths_library_signature" not in st.session_state:
     st.session_state["collection_paths_library_signature"] = ""
 if "ambiguous_collection_paths" not in st.session_state:
     st.session_state["ambiguous_collection_paths"] = {}
+if "enrich_scope" not in st.session_state:
+    st.session_state["enrich_scope"] = "collection"
+if "enrich_max_items" not in st.session_state:
+    st.session_state["enrich_max_items"] = 200
+if "enrich_no_limit" not in st.session_state:
+    st.session_state["enrich_no_limit"] = False
+if "enrich_only_missing_metrics" not in st.session_state:
+    st.session_state["enrich_only_missing_metrics"] = True
+if "enrich_overwrite_existing_metrics" not in st.session_state:
+    st.session_state["enrich_overwrite_existing_metrics"] = False
 
-query = st.text_input("PubMed query", placeholder="e.g. glioblastoma AND immunotherapy")
-max_results = st.number_input(
-    "Max results", min_value=1, max_value=500, value=20, step=1
-)
 pubmed_sort = st.selectbox(
     "PubMed API sort", options=PUBMED_SORT_VALUES, key="pubmed_sort"
 )
@@ -1920,49 +2743,17 @@ openalex_api_key = st.text_input(
     "OpenAlex API key", type="password", key="openalex_api_key"
 )
 
-dry_run = st.checkbox("Preview only (do not write to Zotero)", value=True)
-run_button_label = "Run preview" if dry_run else "Run and import"
-run = st.button(run_button_label)
+import_tab, enrich_tab = st.tabs(["PubMed Import", "Zotero Enrich"])
 
-history_entries = list(st.session_state.get("history_entries", []))
-render_history_section(
-    history_entries=history_entries,
-    library_type=library_type,
-    resolved_library_id=resolved_library_id,
-    selected_existing_path=selected_existing_path,
-    manual_collection_path=manual_collection_path,
-    duplicate_scope=duplicate_scope,
-    skip_duplicates=skip_duplicates,
-    zotero_api_key=zotero_api_key,
-    auto_create_collection=auto_create_collection,
-)
-
-preview_payload = st.session_state.get("preview_payload")
-if preview_payload:
-    render_preview_cache_section(
-        preview_payload=preview_payload,
-        library_type=library_type,
-        resolved_library_id=resolved_library_id,
-        selected_existing_path=selected_existing_path,
-        manual_collection_path=manual_collection_path,
-        duplicate_scope=duplicate_scope,
-        skip_duplicates=skip_duplicates,
-        zotero_api_key=zotero_api_key,
-        auto_create_collection=auto_create_collection,
-        remember_settings=remember_settings,
-    )
-
-if run:
-    run_result = execute_search_pipeline(
-        query=query,
-        max_results=int(max_results),
-        dry_run=dry_run,
+with import_tab:
+    render_pubmed_import_section(
         library_type=library_type,
         zotero_user_id=zotero_user_id,
         zotero_api_key=zotero_api_key,
         resolved_library_id=resolved_library_id,
         selected_existing_path=selected_existing_path,
         manual_collection_path=manual_collection_path,
+        auto_create_collection=auto_create_collection,
         pubmed_sort=pubmed_sort,
         secondary_sort=secondary_sort,
         attach_metrics_to_extra=attach_metrics_to_extra,
@@ -1972,181 +2763,17 @@ if run:
         ncbi_api_key=ncbi_api_key,
         openalex_email=openalex_email,
         openalex_api_key=openalex_api_key,
+        remember_settings=remember_settings,
     )
 
-    validated_library_id = str(run_result["validated_library_id"])
-    target_collection_path = str(run_result["target_collection_path"])
-    display_records = list(run_result["display_records"])
-    import_records = list(run_result["import_records"])
-    skipped_existing = int(run_result["skipped_existing"])
-    skipped_incoming = int(run_result["skipped_incoming"])
-    link_existing = int(run_result["link_existing"])
-
-    st.success(
-        f"Fetched {len(display_records)} records. "
-        f"Importable after dedup: {len(import_records)}."
-    )
-    result_df = pd.DataFrame(
-        [
-            {
-                "Dedup Status": record.get("_dedup_status", "new"),
-                "Planned Action": record.get("_planned_action", "create"),
-                "Will Import": bool(record.get("_will_import", True)),
-                "Cited By": _display_int(record.get("_metric_citation_count")),
-                "Journal Metric": _display_float(
-                    record.get("_metric_journal_2yr_mean_citedness"),
-                    digits=4,
-                ),
-                "Hybrid Score": _display_float(
-                    record.get("_metric_hybrid_score"),
-                    digits=2,
-                ),
-                "Title": record.get("title", ""),
-                "Journal": record.get("publicationTitle", ""),
-                "Date": record.get("date", ""),
-                "DOI": record.get("DOI", ""),
-                "PMID": record.get("PMID", ""),
-                "URL": record.get("url", ""),
-            }
-            for record in display_records
-        ]
-    )
-    st.dataframe(
-        result_df,
-        width="stretch",
-        column_config={
-            "Cited By": st.column_config.NumberColumn("Cited By", format="%d"),
-            "Journal Metric": st.column_config.NumberColumn(
-                "Journal Metric", format="%.4f"
-            ),
-            "Hybrid Score": st.column_config.NumberColumn(
-                "Hybrid Score", format="%.2f"
-            ),
-        },
-    )
-
-    st.info(
-        f"PubMed sort: {pubmed_sort} | Secondary sort: {secondary_sort} | "
-        f"Attach metrics to extra: {attach_metrics_to_extra} | "
-        f"Skip duplicates: {skip_duplicates} ({duplicate_scope})"
-    )
-    if skipped_existing or skipped_incoming:
-        st.caption(
-            f"Dedup summary: skipped existing={skipped_existing}, "
-            f"skipped incoming duplicate={skipped_incoming}, "
-            f"link to collection={link_existing}"
-        )
-
-    if dry_run:
-        history_entry = build_history_entry(
-            event_type="preview",
-            query=query.strip(),
-            pubmed_sort=pubmed_sort,
-            secondary_sort=secondary_sort,
-            target_collection_path=target_collection_path,
-            duplicate_scope=duplicate_scope,
-            skip_duplicates=skip_duplicates,
-            library_type=library_type,
-            library_id=resolved_library_id,
-            display_records=display_records,
-            import_records=import_records,
-            skipped_existing=skipped_existing,
-            skipped_incoming=skipped_incoming,
-        )
-        append_history_entry(history_entry)
-        st.session_state["history_entries"] = load_history()
-        st.session_state["preview_payload"] = {
-            "created_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "query": query.strip(),
-            "display_records": display_records,
-            "import_records": import_records,
-            "skipped_existing": skipped_existing,
-            "skipped_incoming": skipped_incoming,
-            "library_type": library_type,
-            "library_id": resolved_library_id,
-            "target_collection_path": target_collection_path,
-            "auto_create_collection": auto_create_collection,
-            "pubmed_sort": pubmed_sort,
-            "secondary_sort": secondary_sort,
-            "skip_duplicates": skip_duplicates,
-            "duplicate_scope": duplicate_scope,
-            "evaluation_signature": build_execution_signature(
-                library_type=library_type,
-                library_id=resolved_library_id,
-                target_collection_path=target_collection_path,
-                skip_duplicates=skip_duplicates,
-                duplicate_scope=duplicate_scope,
-            ),
-        }
-        if remember_settings:
-            try:
-                save_settings(current_settings())
-            except Exception as exc:
-                st.warning(f"Could not save settings: {exc}")
-        st.success(
-            "Preview cache updated. Use 'Import previewed records now' if you want to import without re-querying."
-        )
-        if target_collection_path:
-            st.info(
-                f"Preview mode only. Target collection path: {target_collection_path}"
-            )
-        else:
-            st.info("Preview mode only. Target: library root.")
-        st.rerun()
-
-    if not import_records:
-        st.info("No new records to import after duplicate filtering.")
-        st.stop()
-
-    with st.spinner("Importing into Zotero..."):
-        try:
-            total_success, total_failed, resolved_collection_key = (
-                import_records_to_zotero(
-                    records=import_records,
-                    library_type=library_type,
-                    library_id=validated_library_id,
-                    zotero_api_key=zotero_api_key.strip(),
-                    target_collection_path=target_collection_path,
-                    auto_create_collection=auto_create_collection,
-                )
-            )
-        except Exception as exc:
-            st.error(f"Import failed: {exc}")
-            st.stop()
-
-    if remember_settings:
-        try:
-            save_settings(current_settings())
-        except Exception as exc:
-            st.warning(f"Could not save settings: {exc}")
-    history_entry = build_history_entry(
-        event_type="import",
-        query=query.strip(),
-        pubmed_sort=pubmed_sort,
-        secondary_sort=secondary_sort,
-        target_collection_path=target_collection_path,
-        duplicate_scope=duplicate_scope,
-        skip_duplicates=skip_duplicates,
+with enrich_tab:
+    render_zotero_enrich_section(
         library_type=library_type,
-        library_id=validated_library_id,
-        display_records=display_records,
-        import_records=import_records,
-        skipped_existing=skipped_existing,
-        skipped_incoming=skipped_incoming,
-        total_success=total_success,
-        total_failed=total_failed,
+        resolved_library_id=resolved_library_id,
+        selected_existing_path=selected_existing_path,
+        manual_collection_path=manual_collection_path,
+        zotero_api_key=zotero_api_key,
+        openalex_email=openalex_email,
+        openalex_api_key=openalex_api_key,
     )
-    append_history_entry(history_entry)
-    st.session_state["history_entries"] = load_history()
-    st.session_state.pop("preview_payload", None)
-
-    if resolved_collection_key:
-        st.success(
-            f"Import finished. Success: {total_success}, Failed: {total_failed}. "
-            f"Collection key: {resolved_collection_key}"
-        )
-    else:
-        st.success(
-            f"Import finished. Success: {total_success}, Failed: {total_failed}."
-        )
 

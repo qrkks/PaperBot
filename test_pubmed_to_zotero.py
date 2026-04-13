@@ -174,8 +174,72 @@ class ItemPayloadTests(unittest.TestCase):
         self.assertEqual(payload[0]["collections"], ["COLL123"])
         self.assertNotIn("_metric_citation_count", payload[0])
 
+    @patch("paperbot.core.requests.post")
+    def test_zotero_update_items_sends_existing_item_extra(self, mock_post: MagicMock) -> None:
+        response = MagicMock()
+        response.text = '{"successful":{"0":{"key":"ITEM1"}}}'
+        response.json.return_value = {"successful": {"0": {"key": "ITEM1"}}}
+        mock_post.return_value = response
+
+        pz.zotero_update_items(
+            library_type="users",
+            library_id="123",
+            api_key="k",
+            items=[
+                {
+                    "key": "ITEM1",
+                    "version": 7,
+                    "extra": "OpenAlex Cited By: 10",
+                    "_metric_citation_count": 10,
+                }
+            ],
+        )
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(
+            payload,
+            [{"key": "ITEM1", "version": 7, "extra": "OpenAlex Cited By: 10"}],
+        )
+
 
 class MetricTests(unittest.TestCase):
+    @patch("paperbot.core.requests.get")
+    def test_list_zotero_items_reads_collection_scope_and_limit(
+        self, mock_get: MagicMock
+    ) -> None:
+        response = MagicMock()
+        response.json.return_value = [
+            {
+                "key": "ITEM1",
+                "version": 3,
+                "data": {
+                    "itemType": "journalArticle",
+                    "title": "Paper 1",
+                    "publicationTitle": "Journal 1",
+                    "date": "2024",
+                    "url": "https://example.org",
+                    "collections": ["COLL1"],
+                    "DOI": "10.1000/abc",
+                    "extra": "PMID: 123",
+                    "ISSN": "1234-5678",
+                },
+            }
+        ]
+        mock_get.return_value = response
+
+        items = pz.list_zotero_items(
+            library_type="users",
+            library_id="123",
+            api_key="k",
+            collection_key="COLL1",
+            limit=1,
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["PMID"], "123")
+        self.assertIn("/collections/COLL1/items", mock_get.call_args.args[0])
+        self.assertEqual(mock_get.call_args.kwargs["params"]["limit"], 1)
+
     def test_apply_secondary_metrics_writes_extra(self) -> None:
         records = [{"title": "Paper 1", "PMID": "123", "extra": "PMID: 123"}]
         metrics = {

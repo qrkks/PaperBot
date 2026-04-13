@@ -702,6 +702,81 @@ def list_existing_items_info(
     return items
 
 
+def list_zotero_items(
+    library_type: str,
+    library_id: str,
+    api_key: str,
+    collection_key: str | None = None,
+    page_size: int = ZOTERO_PAGE_SIZE,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    normalized_library_id = validate_library_id(library_type, library_id)
+    if collection_key:
+        base_url = (
+            f"{ZOTERO_BASE}/{library_type}/{normalized_library_id}"
+            f"/collections/{collection_key}/items"
+        )
+    else:
+        base_url = f"{ZOTERO_BASE}/{library_type}/{normalized_library_id}/items"
+
+    items: list[dict[str, Any]] = []
+    start = 0
+    remaining = max(int(limit), 0) if limit is not None else None
+
+    while True:
+        current_limit = page_size
+        if remaining is not None:
+            if remaining <= 0:
+                break
+            current_limit = min(page_size, remaining)
+
+        response = requests.get(
+            base_url,
+            headers=_zotero_headers(api_key),
+            params={
+                "limit": current_limit,
+                "start": start,
+                "format": "json",
+                "include": "data",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        batch = response.json()
+        if not isinstance(batch, list) or not batch:
+            break
+
+        for item in batch:
+            if not isinstance(item, dict):
+                continue
+            data = item.get("data", {}) or {}
+            items.append(
+                {
+                    "key": str(item.get("key", "")).strip(),
+                    "version": _safe_int(item.get("version")),
+                    "itemType": str(data.get("itemType", "")).strip(),
+                    "title": str(data.get("title", "")).strip(),
+                    "publicationTitle": str(data.get("publicationTitle", "")).strip(),
+                    "date": str(data.get("date", "")).strip(),
+                    "url": str(data.get("url", "")).strip(),
+                    "collections": list(data.get("collections", []) or []),
+                    "DOI": _normalize_doi(data.get("DOI")),
+                    "PMID": _normalize_pmid_value(data.get("PMID"))
+                    or _extract_pmid_from_extra(data.get("extra")),
+                    "ISSN": str(data.get("ISSN", "")).strip(),
+                    "extra": str(data.get("extra", "") or ""),
+                }
+            )
+
+        if remaining is not None:
+            remaining -= len(batch)
+        if len(batch) < current_limit:
+            break
+        start += len(batch)
+
+    return items
+
+
 def build_existing_item_indexes(
     existing_items: list[dict[str, Any]],
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
@@ -870,6 +945,54 @@ def zotero_link_existing_items_to_collection(
         if version is not None:
             payload["version"] = version
         payload_items.append(payload)
+
+    if not payload_items:
+        return {"successful": {}, "failed": {}}
+
+    response = requests.post(
+        url,
+        headers=_zotero_headers(api_key),
+        json=payload_items,
+        timeout=30,
+    )
+    response.raise_for_status()
+    if response.text:
+        return response.json()
+    return {"successful": {}, "failed": {}}
+
+
+def zotero_update_items(
+    library_type: str,
+    library_id: str,
+    api_key: str,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    normalized_library_id = validate_library_id(library_type, library_id)
+    url = f"{ZOTERO_BASE}/{library_type}/{normalized_library_id}/items"
+    payload_items: list[dict[str, Any]] = []
+
+    allowed_fields = {
+        "key",
+        "version",
+        "itemType",
+        "title",
+        "publicationTitle",
+        "date",
+        "url",
+        "DOI",
+        "PMID",
+        "ISSN",
+        "extra",
+        "collections",
+    }
+    for item in items:
+        payload = {
+            key: value
+            for key, value in item.items()
+            if key in allowed_fields and value is not None
+        }
+        if payload.get("key"):
+            payload_items.append(payload)
 
     if not payload_items:
         return {"successful": {}, "failed": {}}

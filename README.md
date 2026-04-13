@@ -15,6 +15,7 @@ It includes:
 - Select or auto-create Zotero collection paths
 - Separate PubMed sorting from local secondary reranking
 - Optional OpenAlex-based citation and journal metrics
+- Enrich existing Zotero items with citation/journal metrics in `extra`
 - Preview before import
 - Re-check duplicate status against the current Zotero state
 - Import from preview cache or history using current form settings
@@ -115,6 +116,11 @@ streamlit run .\app_streamlit.py
 Then open the local URL shown in the terminal, usually `http://localhost:8501`.
 
 If a local `.env` exists, the app now reads it automatically at startup.
+
+The web app has two tabs:
+
+- `PubMed Import`: search PubMed, preview results, and import selected records
+- `Zotero Enrich`: scan existing Zotero items and write OpenAlex-based metrics into `extra`
 
 ### Recommended workflow
 
