@@ -128,6 +128,15 @@ def append_history_entry(entry: dict[str, Any]) -> None:
     save_history(history)
 
 
+def save_to_history_and_update_session(
+    *,
+    history_entry: dict[str, Any],
+) -> None:
+    """Save history entry to file and update session state."""
+    append_history_entry(history_entry)
+    st.session_state["history_entries"] = load_history()
+
+
 def build_history_entry(
     *,
     event_type: str,
@@ -189,6 +198,97 @@ def build_history_entry(
         "total_failed": total_failed,
         "records": preview_rows,
     }
+
+
+def refresh_payload_records(
+    *,
+    payload_state_key: str,
+    library_type: str,
+    library_id: str,
+    zotero_api_key: str,
+    target_collection_path: str,
+    duplicate_scope: str,
+    skip_duplicates: bool,
+) -> tuple[int, int, int, bool, str, int]:
+    """Refresh record status (for history and preview cache).
+
+    Returns:
+        tuple containing: skipped_existing, skipped_incoming, link_existing,
+                         target_collection_missing, effective_duplicate_scope,
+                         changed_rows
+    """
+    if not zotero_api_key.strip():
+        st.error("Refreshing statuses requires Zotero API key.")
+        st.stop()
+    if not library_id:
+        st.error("Current form has no valid library ID.")
+        st.stop()
+    try:
+        validated_library_id = validate_library_id(library_type, library_id)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
+
+    with st.spinner("Refreshing statuses using current form..."):
+        try:
+            return reevaluate_payload_records(
+                payload_state_key=payload_state_key,
+                library_type=library_type,
+                library_id=validated_library_id,
+                zotero_api_key=zotero_api_key.strip(),
+                target_collection_path=normalize_collection_path(target_collection_path),
+                duplicate_scope=duplicate_scope,
+                skip_duplicates=skip_duplicates,
+            )
+        except Exception as exc:
+            st.error(f"Failed to refresh statuses: {exc}")
+            st.stop()
+
+
+def validate_and_refresh_payload_status(
+    *,
+    payload_state_key: str,
+    current_evaluation_signature: str,
+    library_type: str,
+    library_id: str,
+    zotero_api_key: str,
+    target_collection_path: str,
+    duplicate_scope: str,
+    skip_duplicates: bool,
+) -> None:
+    """Validate and refresh payload status, auto-refresh if signatures don't match.
+
+    Args:
+        payload_state_key: The session state key for the payload
+        current_evaluation_signature: The current execution signature
+        library_type: Zotero library type
+        library_id: Zotero library ID
+        zotero_api_key: Zotero API key
+        target_collection_path: Target collection path
+        duplicate_scope: Duplicate checking scope
+        skip_duplicates: Whether to skip duplicates
+    """
+    payload = dict(st.session_state.get(payload_state_key, {}))
+    if str(payload.get("evaluation_signature", "")) != current_evaluation_signature:
+        st.warning(
+            "Status markers were refreshed to match the current form. "
+            "Review the list and click import again."
+        )
+        with st.spinner("Refreshing statuses using current form..."):
+            try:
+                reevaluate_payload_records(
+                    payload_state_key=payload_state_key,
+                    library_type=library_type,
+                    library_id=validate_library_id(library_type, library_id),
+                    zotero_api_key=zotero_api_key.strip(),
+                    target_collection_path=normalize_collection_path(target_collection_path),
+                    duplicate_scope=duplicate_scope,
+                    skip_duplicates=skip_duplicates,
+                )
+            except Exception as exc:
+                st.error(f"Failed to refresh statuses: {exc}")
+                st.stop()
+        st.rerun()
 
 
 def load_settings() -> dict[str, Any]:
@@ -1073,13 +1173,26 @@ if history_entries:
         f"{item.get('created_at', '')} | {item.get('event_type', '')} | {item.get('query', '')}"
         for item in history_entries
     ]
+    # Remember user's selected history index
+    if "selected_history_index" not in st.session_state:
+        st.session_state["selected_history_index"] = 0
+    else:
+        # Check if the stored index is still valid
+        current_index = st.session_state["selected_history_index"]
+        if current_index >= len(history_entries):
+            st.session_state["selected_history_index"] = 0
+
     selected_history_label = st.selectbox(
         "Inspect history entry",
         options=[""] + history_labels,
-        index=0,
+        index=st.session_state["selected_history_index"],
+        on_change=lambda: None,  # Simple callback to maintain index state
+        key="history_selector",
+        label_visibility="collapsed",
     )
     if selected_history_label:
         history_index = history_labels.index(selected_history_label)
+        st.session_state["selected_history_index"] = history_index
         selected_history = history_entries[history_index]
         st.caption(
             f"PubMed sort: {selected_history.get('pubmed_sort', '')} | "
@@ -1180,43 +1293,117 @@ if history_entries:
                 key=f"load_history_{selected_history.get('id', '')}",
             )
 
-        if refresh_history_status:
+        if import_from_history:
+            target_library_id = resolved_library_id
+            target_library_type = library_type
+            target_collection_path = normalize_collection_path(
+                selected_existing_path or manual_collection_path
+            )
             if not zotero_api_key.strip():
-                st.error("Refreshing history statuses requires Zotero API key.")
+                st.error("Importing from history requires Zotero API key.")
                 st.stop()
-            if not resolved_library_id:
+            if not target_library_id:
                 st.error("Current form has no valid library ID.")
                 st.stop()
             try:
-                target_library_id = validate_library_id(library_type, resolved_library_id)
+                target_library_id = validate_library_id(target_library_type, target_library_id)
             except ValueError as exc:
                 st.error(str(exc))
                 st.stop()
 
-            with st.spinner("Refreshing history statuses using current form..."):
+            # Validate and refresh status if needed
+            current_history_signature = build_execution_signature(
+                library_type=target_library_type,
+                library_id=target_library_id,
+                target_collection_path=target_collection_path,
+                skip_duplicates=skip_duplicates,
+                duplicate_scope=duplicate_scope,
+            )
+            validate_and_refresh_payload_status(
+                payload_state_key=history_payload_key,
+                current_evaluation_signature=current_history_signature,
+                library_type=target_library_type,
+                library_id=target_library_id,
+                zotero_api_key=zotero_api_key,
+                target_collection_path=target_collection_path,
+                duplicate_scope=duplicate_scope,
+                skip_duplicates=skip_duplicates,
+            )
+
+            current_history_payload = dict(st.session_state.get(history_payload_key, {}))
+            history_import_display_records = list(current_history_payload.get("display_records", []))
+            import_history_records = [
+                row
+                for row in history_import_display_records
+                if row.get("_selected", False)
+                and row.get("_planned_action", "create") in {"create", "link"}
+            ]
+            skipped_existing = int(current_history_payload.get("skipped_existing", 0))
+            skipped_incoming = int(current_history_payload.get("skipped_incoming", 0))
+
+            if not import_history_records:
+                st.warning("No actionable history records selected for import.")
+                st.stop()
+
+            with st.spinner("Importing selected history records into Zotero..."):
                 try:
-                    (
-                        _,
-                        skipped_existing,
-                        skipped_incoming,
-                        link_existing,
-                        target_collection_missing,
-                        effective_duplicate_scope,
-                        changed_rows,
-                    ) = reevaluate_payload_records(
-                        payload_state_key=history_payload_key,
-                        library_type=library_type,
+                    total_success, total_failed, resolved_collection_key = import_records_to_zotero(
+                        records=import_history_records,
+                        library_type=target_library_type,
                         library_id=target_library_id,
                         zotero_api_key=zotero_api_key.strip(),
-                        target_collection_path=normalize_collection_path(
-                            selected_existing_path or manual_collection_path
-                        ),
-                        duplicate_scope=duplicate_scope,
-                        skip_duplicates=skip_duplicates,
+                        target_collection_path=target_collection_path,
+                        auto_create_collection=auto_create_collection,
                     )
                 except Exception as exc:
-                    st.error(f"Failed to refresh history statuses: {exc}")
+                    st.error(f"Import from history failed: {exc}")
                     st.stop()
+
+            history_entry = build_history_entry(
+                event_type="import-from-history",
+                query=str(selected_history.get("query", "")),
+                pubmed_sort=str(selected_history.get("pubmed_sort", "relevance")),
+                secondary_sort=str(selected_history.get("secondary_sort", "none")),
+                target_collection_path=target_collection_path,
+                duplicate_scope=duplicate_scope,
+                skip_duplicates=skip_duplicates,
+                library_type=target_library_type,
+                library_id=target_library_id,
+                display_records=history_import_display_records,
+                import_records=import_history_records,
+                skipped_existing=skipped_existing,
+                skipped_incoming=skipped_incoming,
+                total_success=total_success,
+                total_failed=total_failed,
+            )
+            save_to_history_and_update_session(history_entry)
+            if resolved_collection_key:
+                st.success(
+                    f"History import finished. Success: {total_success}, Failed: {total_failed}. "
+                    f"Collection key: {resolved_collection_key}"
+                )
+            else:
+                st.success(
+                    f"History import finished. Success: {total_success}, Failed: {total_failed}."
+                )
+
+        if refresh_history_status:
+            (
+                skipped_existing,
+                skipped_incoming,
+                link_existing,
+                target_collection_missing,
+                effective_duplicate_scope,
+                changed_rows,
+            ) = refresh_payload_records(
+                payload_state_key=history_payload_key,
+                library_type=library_type,
+                library_id=resolved_library_id,
+                zotero_api_key=zotero_api_key,
+                target_collection_path=selected_existing_path or manual_collection_path,
+                duplicate_scope=duplicate_scope,
+                skip_duplicates=skip_duplicates,
+            )
 
             if target_collection_missing and (selected_existing_path or manual_collection_path):
                 st.info(
@@ -1316,8 +1503,8 @@ if history_entries:
                 total_success=total_success,
                 total_failed=total_failed,
             )
-            append_history_entry(history_entry)
-            st.session_state["history_entries"] = load_history()
+            save_to_history_and_update_session(history_entry)
+            st.session_state.pop("preview_payload", None)
             if resolved_collection_key:
                 st.success(
                     f"History import finished. Success: {total_success}, Failed: {total_failed}. "
@@ -1427,42 +1614,22 @@ if preview_payload:
         st.rerun()
 
     if refresh_preview_status:
-        if not zotero_api_key.strip():
-            st.error("Refreshing preview statuses requires Zotero API key.")
-            st.stop()
-        if not resolved_library_id:
-            st.error("Current form has no valid library ID.")
-            st.stop()
-        try:
-            current_library_id = validate_library_id(library_type, resolved_library_id)
-        except ValueError as exc:
-            st.error(str(exc))
-            st.stop()
-
-        with st.spinner("Refreshing preview statuses using current form..."):
-            try:
-                (
-                    _,
-                    skipped_existing,
-                    skipped_incoming,
-                    link_existing,
-                    target_collection_missing,
-                    effective_duplicate_scope,
-                    changed_rows,
-                ) = reevaluate_payload_records(
-                    payload_state_key="preview_payload",
-                    library_type=library_type,
-                    library_id=current_library_id,
-                    zotero_api_key=zotero_api_key.strip(),
-                    target_collection_path=normalize_collection_path(
-                        selected_existing_path or manual_collection_path
-                    ),
-                    duplicate_scope=duplicate_scope,
-                    skip_duplicates=skip_duplicates,
-                )
-            except Exception as exc:
-                st.error(f"Failed to refresh preview statuses: {exc}")
-                st.stop()
+        (
+            skipped_existing,
+            skipped_incoming,
+            link_existing,
+            target_collection_missing,
+            effective_duplicate_scope,
+            changed_rows,
+        ) = refresh_payload_records(
+            payload_state_key="preview_payload",
+            library_type=library_type,
+            library_id=resolved_library_id,
+            zotero_api_key=zotero_api_key,
+            target_collection_path=selected_existing_path or manual_collection_path,
+            duplicate_scope=duplicate_scope,
+            skip_duplicates=skip_duplicates,
+        )
 
         if target_collection_missing and (selected_existing_path or manual_collection_path):
             st.info(
@@ -1501,25 +1668,17 @@ if preview_payload:
             st.error(f"Current form library ID invalid: {exc}")
             st.stop()
 
-        if str(preview_payload.get("evaluation_signature", "")) != current_preview_signature:
-            st.warning(
-                "Status markers were refreshed to match the current form. Review the list and click import again."
-            )
-            with st.spinner("Refreshing preview statuses using current form..."):
-                try:
-                    reevaluate_payload_records(
-                        payload_state_key="preview_payload",
-                        library_type=current_library_type,
-                        library_id=current_library_id,
-                        zotero_api_key=zotero_api_key.strip(),
-                        target_collection_path=current_target_collection_path,
-                        duplicate_scope=duplicate_scope,
-                        skip_duplicates=skip_duplicates,
-                    )
-                except Exception as exc:
-                    st.error(f"Failed to refresh preview statuses: {exc}")
-                    st.stop()
-            st.rerun()
+        # Validate and refresh status if needed
+        validate_and_refresh_payload_status(
+            payload_state_key="preview_payload",
+            current_evaluation_signature=current_preview_signature,
+            library_type=current_library_type,
+            library_id=current_library_id,
+            zotero_api_key=zotero_api_key,
+            target_collection_path=current_target_collection_path,
+            duplicate_scope=duplicate_scope,
+            skip_duplicates=skip_duplicates,
+        )
 
         current_preview_payload = dict(st.session_state.get("preview_payload", {}))
         preview_import_display_records = list(current_preview_payload.get("display_records", []))
