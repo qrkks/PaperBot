@@ -140,6 +140,11 @@ def parse_args() -> argparse.Namespace:
         help="Do not write secondary metrics into Zotero extra field.",
     )
     parser.add_argument(
+        "--no-attach-pdf-links",
+        action="store_true",
+        help="Do not add Open Access PDF link attachments when available.",
+    )
+    parser.add_argument(
         "--ncbi-email",
         default=os.getenv("NCBI_EMAIL"),
         help="Optional email for NCBI E-utilities polite usage.",
@@ -1140,7 +1145,7 @@ def fetch_openalex_metrics_by_pmids(
         params: dict[str, Any] = {
             "filter": f"pmid:{'|'.join(pmid_batch)}",
             "per-page": 200,
-            "select": "id,ids,cited_by_count,primary_location",
+            "select": "id,ids,cited_by_count,primary_location,best_oa_location,open_access",
         }
         params.update(_openalex_common_params(email, api_key))
 
@@ -1158,8 +1163,10 @@ def fetch_openalex_metrics_by_pmids(
                 continue
 
             citation_count = _safe_int(work.get("cited_by_count"))
+            best_oa_location = work.get("best_oa_location", {}) or {}
             primary_location = work.get("primary_location", {}) or {}
             source = primary_location.get("source", {}) or {}
+            open_access = work.get("open_access", {}) or {}
 
             source_name = str(source.get("display_name", "")).strip()
             source_issn = str(source.get("issn_l", "")).strip()
@@ -1170,6 +1177,12 @@ def fetch_openalex_metrics_by_pmids(
 
             source_stats = source.get("summary_stats", {}) or {}
             journal_metric = _safe_float(source_stats.get("2yr_mean_citedness"))
+            pdf_url = str(
+                best_oa_location.get("pdf_url")
+                or primary_location.get("pdf_url")
+                or ""
+            ).strip()
+            oa_url = str(open_access.get("oa_url") or "").strip()
 
             previous = metrics.get(pmid)
             if previous:
@@ -1187,6 +1200,8 @@ def fetch_openalex_metrics_by_pmids(
                 "source_name": source_name,
                 "source_issn": source_issn,
                 "openalex_work_id": str(work.get("id", "")).strip(),
+                "pdf_url": pdf_url,
+                "oa_url": oa_url,
             }
             if source_issn and journal_metric is None:
                 pmid_to_source_issn[pmid] = source_issn
@@ -1410,11 +1425,15 @@ def apply_secondary_metrics_to_records(
         journal_metric = _safe_float(metric.get("journal_metric_2yr_mean_citedness"))
         source_name = str(metric.get("source_name", "")).strip()
         hybrid_score = _compute_hybrid_score(citation_count, journal_metric)
+        pdf_url = str(metric.get("pdf_url", "")).strip()
+        oa_url = str(metric.get("oa_url", "")).strip()
 
         record["_metric_citation_count"] = citation_count
         record["_metric_journal_2yr_mean_citedness"] = journal_metric
         record["_metric_hybrid_score"] = hybrid_score
         record["_metric_source_name"] = source_name
+        record["_oa_pdf_url"] = pdf_url
+        record["_oa_url"] = oa_url
 
         if attach_to_extra:
             record["extra"] = _upsert_extra_metric_lines(
@@ -1432,6 +1451,44 @@ def apply_secondary_metrics_to_records(
                 journal_metric=journal_metric,
                 hybrid_score=hybrid_score,
             )
+
+
+def _extract_created_item_key(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("key", "")).strip()
+    return str(value or "").strip()
+
+
+def build_pdf_link_attachment_items(
+    parent_records: list[dict[str, Any]],
+    create_result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    attachment_items: list[dict[str, Any]] = []
+    successful = create_result.get("successful", {}) or {}
+    for local_index, result_value in successful.items():
+        if not str(local_index).isdigit():
+            continue
+        idx = int(local_index)
+        if idx < 0 or idx >= len(parent_records):
+            continue
+        parent_key = _extract_created_item_key(result_value)
+        if not parent_key:
+            continue
+        parent_record = parent_records[idx]
+        pdf_url = str(parent_record.get("_oa_pdf_url", "") or "").strip()
+        if not pdf_url:
+            continue
+        attachment_items.append(
+            {
+                "itemType": "attachment",
+                "parentItem": parent_key,
+                "linkMode": "linked_url",
+                "title": "Open Access PDF",
+                "url": pdf_url,
+                "contentType": "application/pdf",
+            }
+        )
+    return attachment_items
 
 
 def secondary_sort_records(
@@ -1503,6 +1560,43 @@ def zotero_create_items(
     return {"successful": {}}
 
 
+def zotero_create_link_attachments(
+    library_type: str,
+    library_id: str,
+    api_key: str,
+    attachment_items: list[dict[str, Any]],
+    batch_size: int = 25,
+) -> dict[str, Any]:
+    normalized_library_id = validate_library_id(library_type, library_id)
+    url = f"{ZOTERO_BASE}/{library_type}/{normalized_library_id}/items"
+    if not attachment_items:
+        return {"successful": {}, "failed": {}}
+
+    merged_successful: dict[str, Any] = {}
+    merged_failed: dict[str, Any] = {}
+    global_index = 0
+    batch_size = max(int(batch_size), 1)
+
+    for batch in chunked(attachment_items, batch_size):
+        response = requests.post(
+            url,
+            headers=_zotero_headers(api_key),
+            json=batch,
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = response.json() if response.text else {"successful": {}, "failed": {}}
+        for local_index, value in (result.get("successful", {}) or {}).items():
+            if str(local_index).isdigit():
+                merged_successful[str(global_index + int(local_index))] = value
+        for local_index, value in (result.get("failed", {}) or {}).items():
+            if str(local_index).isdigit():
+                merged_failed[str(global_index + int(local_index))] = value
+        global_index += len(batch)
+
+    return {"successful": merged_successful, "failed": merged_failed}
+
+
 def chunked(seq: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
@@ -1532,6 +1626,7 @@ def main() -> int:
     auto_create_collection = not args.no_create_collection_if_missing
     skip_duplicates = not args.no_skip_duplicates
     attach_metrics_to_extra = not args.no_attach_metrics_to_extra
+    attach_pdf_links = not args.no_attach_pdf_links
 
     pmids = search_pubmed_ids(
         args.query,
@@ -1671,6 +1766,8 @@ def main() -> int:
 
     total_success = 0
     total_failed = 0
+    attachment_success = 0
+    attachment_failed = 0
     create_records = [record for record in records if record.get("_planned_action") != "link"]
     link_records = [record for record in records if record.get("_planned_action") == "link"]
 
@@ -1688,6 +1785,25 @@ def main() -> int:
         failed_count = len(result.get("failed", {}) or {})
         total_success += success_count
         total_failed += failed_count
+        if attach_pdf_links:
+            attachment_items = build_pdf_link_attachment_items(batch, result)
+            if attachment_items:
+                try:
+                    attachment_result = zotero_create_link_attachments(
+                        library_type=args.library_type,
+                        library_id=library_id,
+                        api_key=args.zotero_api_key,
+                        attachment_items=attachment_items,
+                    )
+                    attachment_success += len(
+                        attachment_result.get("successful", {}) or {}
+                    )
+                    attachment_failed += len(
+                        attachment_result.get("failed", {}) or {}
+                    )
+                except Exception as exc:
+                    attachment_failed += len(attachment_items)
+                    print(f"Warning: failed to attach some OA PDF links. {exc}")
         time.sleep(0.35)
 
     for batch in chunked(link_records, 50):
@@ -1707,6 +1823,11 @@ def main() -> int:
         time.sleep(0.35)
 
     print(f"Imported to Zotero. Success: {total_success}, Failed: {total_failed}")
+    if attach_pdf_links:
+        print(
+            "OA PDF link attachments: "
+            f"added={attachment_success}, failed={attachment_failed}"
+        )
     return 0
 
 

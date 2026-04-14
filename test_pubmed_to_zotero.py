@@ -222,6 +222,36 @@ class ItemPayloadTests(unittest.TestCase):
         )
 
     @patch("paperbot.core.requests.post")
+    def test_zotero_create_link_attachments_sends_pdf_link_children(
+        self, mock_post: MagicMock
+    ) -> None:
+        response = MagicMock()
+        response.text = '{"successful":{"0":{"key":"ATT1"}}}'
+        response.json.return_value = {"successful": {"0": {"key": "ATT1"}}}
+        mock_post.return_value = response
+
+        pz.zotero_create_link_attachments(
+            library_type="users",
+            library_id="123",
+            api_key="k",
+            attachment_items=[
+                {
+                    "itemType": "attachment",
+                    "parentItem": "ITEM1",
+                    "linkMode": "linked_url",
+                    "title": "Open Access PDF",
+                    "url": "https://example.org/full.pdf",
+                    "contentType": "application/pdf",
+                }
+            ],
+        )
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(payload[0]["parentItem"], "ITEM1")
+        self.assertEqual(payload[0]["linkMode"], "linked_url")
+        self.assertEqual(payload[0]["contentType"], "application/pdf")
+
+    @patch("paperbot.core.requests.post")
     def test_zotero_update_items_batches_and_reindexes_results(
         self, mock_post: MagicMock
     ) -> None:
@@ -566,6 +596,12 @@ class MetricTests(unittest.TestCase):
                     "id": "https://openalex.org/W1",
                     "ids": {"pmid": "https://pubmed.ncbi.nlm.nih.gov/12345678"},
                     "cited_by_count": 12,
+                    "best_oa_location": {
+                        "pdf_url": "https://example.org/full.pdf",
+                    },
+                    "open_access": {
+                        "oa_url": "https://example.org/landing",
+                    },
                     "primary_location": {
                         "source": {
                             "display_name": "Journal A",
@@ -581,8 +617,12 @@ class MetricTests(unittest.TestCase):
         metrics = pz.fetch_openalex_metrics_by_pmids(["12345678"])
 
         self.assertIn("12345678", metrics)
+        self.assertEqual(metrics["12345678"]["pdf_url"], "https://example.org/full.pdf")
         params = mock_get.call_args.kwargs["params"]
-        self.assertEqual(params["select"], "id,ids,cited_by_count,primary_location")
+        self.assertEqual(
+            params["select"],
+            "id,ids,cited_by_count,primary_location,best_oa_location,open_access",
+        )
 
 
 if __name__ == "__main__":

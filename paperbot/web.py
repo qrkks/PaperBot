@@ -15,6 +15,7 @@ from paperbot.core import (
     SECONDARY_SORT_VALUES,
     apply_secondary_metrics_to_records,
     backfill_journal_metrics_from_record_issns,
+    build_pdf_link_attachment_items,
     build_collection_paths,
     collect_collection_tree_keys,
     chunked,
@@ -31,6 +32,7 @@ from paperbot.core import (
     secondary_sort_records,
     search_pubmed_ids,
     validate_library_id,
+    zotero_create_link_attachments,
     zotero_create_items,
     zotero_link_existing_items_to_collection,
     zotero_update_items,
@@ -56,6 +58,7 @@ SETTINGS_KEYS = [
     "attach_metrics_to_extra",
     "skip_duplicates",
     "duplicate_scope",
+    "attach_pdf_links",
     "openalex_email",
     "openalex_api_key",
     "ncbi_email",
@@ -75,6 +78,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "attach_metrics_to_extra": True,
     "skip_duplicates": True,
     "duplicate_scope": "library",
+    "attach_pdf_links": True,
     "openalex_email": "",
     "openalex_api_key": "",
     "ncbi_email": "",
@@ -342,6 +346,10 @@ def load_env_settings() -> dict[str, Any]:
         ),
         "skip_duplicates": _env_flag("SKIP_DUPLICATES", DEFAULT_SETTINGS["skip_duplicates"]),
         "duplicate_scope": duplicate_scope,
+        "attach_pdf_links": _env_flag(
+            "ATTACH_PDF_LINKS",
+            DEFAULT_SETTINGS["attach_pdf_links"],
+        ),
         "openalex_email": os.getenv("OPENALEX_EMAIL", DEFAULT_SETTINGS["openalex_email"]),
         "openalex_api_key": os.getenv("OPENALEX_API_KEY", DEFAULT_SETTINGS["openalex_api_key"]),
         "ncbi_email": os.getenv("NCBI_EMAIL", DEFAULT_SETTINGS["ncbi_email"]),
@@ -396,7 +404,8 @@ def import_records_to_zotero(
     zotero_api_key: str,
     target_collection_path: str,
     auto_create_collection: bool,
-) -> tuple[int, int, str | None]:
+    attach_pdf_links: bool,
+) -> tuple[int, int, str | None, int, int]:
     resolved_collection_key: str | None = None
     if target_collection_path:
         resolved_collection_key = ensure_collection_path(
@@ -409,6 +418,8 @@ def import_records_to_zotero(
 
     total_success = 0
     total_failed = 0
+    attachment_success = 0
+    attachment_failed = 0
     create_records = [
         record for record in records if record.get("_planned_action", "create") != "link"
     ]
@@ -426,6 +437,24 @@ def import_records_to_zotero(
         )
         total_success += len(result.get("successful", {}) or {})
         total_failed += len(result.get("failed", {}) or {})
+        if attach_pdf_links:
+            attachment_items = build_pdf_link_attachment_items(batch, result)
+            if attachment_items:
+                try:
+                    attachment_result = zotero_create_link_attachments(
+                        library_type=library_type,
+                        library_id=library_id,
+                        api_key=zotero_api_key,
+                        attachment_items=attachment_items,
+                    )
+                    attachment_success += len(
+                        attachment_result.get("successful", {}) or {}
+                    )
+                    attachment_failed += len(
+                        attachment_result.get("failed", {}) or {}
+                    )
+                except Exception:
+                    attachment_failed += len(attachment_items)
 
     for batch in chunked(link_records, 50):
         if not batch or not resolved_collection_key:
@@ -439,7 +468,13 @@ def import_records_to_zotero(
         )
         total_success += len(result.get("successful", {}) or {})
         total_failed += len(result.get("failed", {}) or {})
-    return total_success, total_failed, resolved_collection_key
+    return (
+        total_success,
+        total_failed,
+        resolved_collection_key,
+        attachment_success,
+        attachment_failed,
+    )
 
 
 def build_execution_signature(
@@ -1364,6 +1399,7 @@ def render_history_section(
     manual_collection_path: str,
     duplicate_scope: str,
     skip_duplicates: bool,
+    attach_pdf_links: bool,
     zotero_api_key: str,
     auto_create_collection: bool,
 ) -> None:
@@ -1566,7 +1602,13 @@ def render_history_section(
 
         with st.spinner("Importing selected history records into Zotero..."):
             try:
-                total_success, total_failed, resolved_collection_key = (
+                (
+                    total_success,
+                    total_failed,
+                    resolved_collection_key,
+                    attachment_success,
+                    attachment_failed,
+                ) = (
                     import_records_to_zotero(
                         records=import_history_records,
                         library_type=target_library_type,
@@ -1574,6 +1616,7 @@ def render_history_section(
                         zotero_api_key=zotero_api_key.strip(),
                         target_collection_path=target_collection_path,
                         auto_create_collection=auto_create_collection,
+                        attach_pdf_links=attach_pdf_links,
                     )
                 )
             except Exception as exc:
@@ -1606,6 +1649,10 @@ def render_history_section(
         else:
             st.success(
                 f"History import finished. Success: {total_success}, Failed: {total_failed}."
+            )
+        if attach_pdf_links:
+            st.caption(
+                f"OA PDF link attachments: added={attachment_success}, failed={attachment_failed}"
             )
 
     if refresh_history_status or history_recheck_now:
@@ -1676,6 +1723,7 @@ def render_preview_cache_section(
     manual_collection_path: str,
     duplicate_scope: str,
     skip_duplicates: bool,
+    attach_pdf_links: bool,
     zotero_api_key: str,
     auto_create_collection: bool,
     remember_settings: bool,
@@ -1849,7 +1897,13 @@ def render_preview_cache_section(
 
         with st.spinner("Importing previewed records into Zotero..."):
             try:
-                total_success, total_failed, resolved_collection_key = (
+                (
+                    total_success,
+                    total_failed,
+                    resolved_collection_key,
+                    attachment_success,
+                    attachment_failed,
+                ) = (
                     import_records_to_zotero(
                         records=preview_import_records,
                         library_type=current_library_type,
@@ -1857,6 +1911,7 @@ def render_preview_cache_section(
                         zotero_api_key=zotero_api_key.strip(),
                         target_collection_path=current_target_collection_path,
                         auto_create_collection=auto_create_collection,
+                        attach_pdf_links=attach_pdf_links,
                     )
                 )
             except Exception as exc:
@@ -1897,6 +1952,10 @@ def render_preview_cache_section(
         else:
             st.success(
                 f"Import finished. Success: {total_success}, Failed: {total_failed}."
+            )
+        if attach_pdf_links:
+            st.caption(
+                f"OA PDF link attachments: added={attachment_success}, failed={attachment_failed}"
             )
 
 
@@ -2358,6 +2417,7 @@ def render_pubmed_import_section(
     pubmed_sort: str,
     secondary_sort: str,
     attach_metrics_to_extra: bool,
+    attach_pdf_links: bool,
     skip_duplicates: bool,
     duplicate_scope: str,
     ncbi_email: str,
@@ -2386,6 +2446,7 @@ def render_pubmed_import_section(
         manual_collection_path=manual_collection_path,
         duplicate_scope=duplicate_scope,
         skip_duplicates=skip_duplicates,
+        attach_pdf_links=attach_pdf_links,
         zotero_api_key=zotero_api_key,
         auto_create_collection=auto_create_collection,
     )
@@ -2400,6 +2461,7 @@ def render_pubmed_import_section(
             manual_collection_path=manual_collection_path,
             duplicate_scope=duplicate_scope,
             skip_duplicates=skip_duplicates,
+            attach_pdf_links=attach_pdf_links,
             zotero_api_key=zotero_api_key,
             auto_create_collection=auto_create_collection,
             remember_settings=remember_settings,
@@ -2421,6 +2483,7 @@ def render_pubmed_import_section(
         pubmed_sort=pubmed_sort,
         secondary_sort=secondary_sort,
         attach_metrics_to_extra=attach_metrics_to_extra,
+        attach_pdf_links=attach_pdf_links,
         skip_duplicates=skip_duplicates,
         duplicate_scope=duplicate_scope,
         ncbi_email=ncbi_email,
@@ -2483,6 +2546,7 @@ def render_pubmed_import_section(
     st.info(
         f"PubMed sort: {pubmed_sort} | Secondary sort: {secondary_sort} | "
         f"Attach metrics to extra: {attach_metrics_to_extra} | "
+        f"Attach PDF links: {attach_pdf_links} | "
         f"Skip duplicates: {skip_duplicates} ({duplicate_scope})"
     )
     if skipped_existing or skipped_incoming:
@@ -2555,7 +2619,13 @@ def render_pubmed_import_section(
 
     with st.spinner("Importing into Zotero..."):
         try:
-            total_success, total_failed, resolved_collection_key = (
+            (
+                total_success,
+                total_failed,
+                resolved_collection_key,
+                attachment_success,
+                attachment_failed,
+            ) = (
                 import_records_to_zotero(
                     records=import_records,
                     library_type=library_type,
@@ -2563,6 +2633,7 @@ def render_pubmed_import_section(
                     zotero_api_key=zotero_api_key.strip(),
                     target_collection_path=target_collection_path,
                     auto_create_collection=auto_create_collection,
+                    attach_pdf_links=attach_pdf_links,
                 )
             )
         except Exception as exc:
@@ -2603,6 +2674,10 @@ def render_pubmed_import_section(
     else:
         st.success(
             f"Import finished. Success: {total_success}, Failed: {total_failed}."
+        )
+    if attach_pdf_links:
+        st.caption(
+            f"OA PDF link attachments: added={attachment_success}, failed={attachment_failed}"
         )
 
 
@@ -2647,6 +2722,10 @@ secondary_sort = st.selectbox(
 attach_metrics_to_extra = st.checkbox(
     "Attach citation/journal metrics to Zotero extra",
     key="attach_metrics_to_extra",
+)
+attach_pdf_links = st.checkbox(
+    "Attach OA PDF link attachments when available",
+    key="attach_pdf_links",
 )
 skip_duplicates = st.checkbox(
     "Skip duplicates already in Zotero (DOI/PMID)",
