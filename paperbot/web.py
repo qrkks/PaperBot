@@ -2897,6 +2897,7 @@ with import_tab:
         pubmed_sort=pubmed_sort,
         secondary_sort=secondary_sort,
         attach_metrics_to_extra=attach_metrics_to_extra,
+        attach_pdf_links=attach_pdf_links,
         skip_duplicates=skip_duplicates,
         duplicate_scope=duplicate_scope,
         ncbi_email=ncbi_email,
